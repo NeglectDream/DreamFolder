@@ -2,7 +2,7 @@
 //!
 //! 行式文本，无依赖、可手改：
 //! ```text
-//! 360Folder session v1
+//! DreamFolder session v1
 //! C:\Users\me\Desktop<TAB>medium<TAB>1
 //! D:\Projects<TAB>detail<TAB>0
 //! ```
@@ -11,7 +11,7 @@
 use super::settings::ViewMode;
 use std::path::{Path, PathBuf};
 
-const HEADER: &str = "360Folder session v1";
+const HEADER: &str = "DreamFolder session v1";
 const MAX_TABS: usize = 64;
 
 #[derive(Debug, Clone)]

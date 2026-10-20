@@ -4,23 +4,27 @@ use std::path::Path;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 
-use crate::win::to_wide_raw;
+use crate::win::to_wide;
 
 const SW_SHOWNORMAL: i32 = 1;
 
 /// ShellExecuteW 的返回值 > 32 才算成功。
+///
+/// **每个字符串都必须 NUL 结尾**：`ShellExecuteW` 没有长度参数，全靠
+/// 结尾的 0 定界。以前这里用的是 `to_wide_raw`（不补 0），Shell 会一路
+/// 读到缓冲区外的垃圾，返回值永远 ≤ 32——「双击打不开、打开方式无效、
+/// 属性弹不出来」全是这一个原因。
 fn invoke(hwnd: HWND, verb: &str, file: &Path, params: Option<&str>) -> Result<(), String> {
-    let verb_w = to_wide_raw(verb);
-    let file_w = to_wide_raw(&file.to_string_lossy());
-    let params_w: Vec<u16> = match params {
-        Some(p) => to_wide_raw(p),
-        None => Vec::new(),
-    };
-    let params_ptr = if params_w.is_empty() {
-        std::ptr::null()
-    } else {
-        params_w.as_ptr()
-    };
+    let verb_w = to_wide(verb);
+    // Shell 不认 verbatim 前缀，直接传过去一律「找不到文件」
+    let file = crate::fs::strip_verbatim(file);
+    let file_w = to_wide(&file.to_string_lossy());
+    // 可选参数：None 时传 NULL，而不是「空 Vec 的 dangling 指针」
+    let params_w = params.map(to_wide);
+    let params_ptr = params_w
+        .as_ref()
+        .map(|v| v.as_ptr())
+        .unwrap_or(std::ptr::null());
 
     let ret = unsafe {
         ShellExecuteW(
@@ -61,7 +65,17 @@ fn describe_shell_execute(code: isize) -> String {
 
 /// 用系统默认程序打开文件，或进入目录。
 pub fn open_default(hwnd: HWND, path: &Path) -> Result<(), String> {
-    invoke(hwnd, "open", path, None)
+    // 先按关联打开；没有关联时 Shell 会返回 SE_ERR_NOASSOC，
+    // 这时退回「打开方式」动词，让系统弹出选择程序对话框——资源管理器就是这么做的。
+    let first = invoke(hwnd, "open", path, None);
+    if first.is_ok() {
+        return Ok(());
+    }
+    match invoke(hwnd, "openas", path, None) {
+        Ok(()) => Ok(()),
+        // 两个都失败就报最初的原因，它对用户更有信息量
+        Err(_) => first,
+    }
 }
 
 /// 弹出「打开方式」选择器。
@@ -89,20 +103,16 @@ pub fn open_in_system_explorer(path: &Path) -> Result<(), String> {
     invoke(std::ptr::null_mut(), "open", path, None)
 }
 
-/// 打开控制面板的「文件夹选项」页面。
-///
-/// 原软件通过 `shell32.dll,Options_RunDLL` 调用（PE 字符串中的
-/// `name Microsoft.FolderOptions` 即为此用途）。
-pub fn open_folder_options() -> Result<(), String> {
-    let verb = to_wide_raw("open");
-    let file = to_wide_raw("rundll32.exe");
-    let params = to_wide_raw("shell32.dll,Options_RunDLL 0");
+/// 打开 URL（http/https/mailto 等）。供菜单里的「反馈」使用。
+pub fn open_url(url: &str) -> Result<(), String> {
+    let verb = to_wide("open");
+    let target = to_wide(url);
     let ret = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
             verb.as_ptr(),
-            file.as_ptr(),
-            params.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
             std::ptr::null(),
             SW_SHOWNORMAL,
         )
@@ -114,16 +124,75 @@ pub fn open_folder_options() -> Result<(), String> {
     }
 }
 
-/// 打开「系统属性」的回收站设置等常见位置（供后续扩展）。
-pub fn open_url(url: &str) -> Result<(), String> {
-    let verb = to_wide_raw("open");
-    let target = to_wide_raw(url);
+/// 用指定程序打开一批文件（把一个或多个文件当参数传给它）。
+///
+/// 用于「拖到某个 .exe 上用它打开」。`lpParameters` 是**一整条命令行**，
+/// 所以每段自己加引号：路径里有空格时不加引号会被拆成多个参数。
+pub fn run_with_program(program: &Path, args: &[std::path::PathBuf]) -> Result<(), String> {
+    let program = crate::fs::strip_verbatim(program);
+    let mut cmdline = String::new();
+    for a in args {
+        if !cmdline.is_empty() {
+            cmdline.push(' ');
+        }
+        let s = crate::fs::strip_verbatim(a).to_string_lossy().to_string();
+        if s.contains(' ') || s.contains('\t') {
+            cmdline.push('"');
+            cmdline.push_str(&s);
+            cmdline.push('"');
+        } else {
+            cmdline.push_str(&s);
+        }
+    }
+    let workdir = program.parent().map(|p| p.to_path_buf());
+    if args.is_empty() {
+        return invoke(std::ptr::null_mut(), "open", &program, None);
+    }
+    let verb = to_wide("open");
+    let file = to_wide(&program.to_string_lossy());
+    let params = to_wide(&cmdline);
+    let cwd = workdir.map(|d| to_wide(&d.to_string_lossy()));
     let ret = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
             verb.as_ptr(),
-            target.as_ptr(),
-            std::ptr::null(),
+            file.as_ptr(),
+            params.as_ptr(),
+            cwd.as_ref()
+                .map(|v| v.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            SW_SHOWNORMAL,
+        )
+    };
+    if ret as isize > 32 {
+        Ok(())
+    } else {
+        Err(describe_shell_execute(ret as isize))
+    }
+}
+
+/// 打开控制面板的「文件夹选项」页面。
+///
+/// 原软件通过 `shell32.dll,Options_RunDLL` 调用（PE 字符串中的
+/// `name Microsoft.FolderOptions` 即为此用途）。
+/// 打开系统回收站。
+///
+/// 回收站是 Shell 命名空间里的虚拟目录，没有盘符路径可枚举，
+/// 走 `shell:RecycleBinFolder` 让系统自己开一个窗口是最稳的做法。
+pub fn open_recycle_bin(hwnd: HWND) -> Result<(), String> {
+    invoke(hwnd, "open", Path::new("shell:RecycleBinFolder"), None)
+}
+
+pub fn open_folder_options() -> Result<(), String> {
+    let verb = to_wide("open");
+    let file = to_wide("rundll32.exe");
+    let params = to_wide("shell32.dll,Options_RunDLL 0");
+    let ret = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
             std::ptr::null(),
             SW_SHOWNORMAL,
         )
@@ -194,6 +263,84 @@ pub fn set_clipboard_files(paths: &[std::path::PathBuf]) -> bool {
     }
 }
 
+/// 把纯文本放到剪贴板（CF_UNICODETEXT），供「复制路径」使用。
+pub fn set_clipboard_text(text: &str) -> bool {
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+
+    /// CF_UNICODETEXT：windows-sys 把它放在 `Win32_System_Ole`，
+    /// 为了一个常量不值得多引一个模块，直接按 WinUser.h 写值。
+    const CF_UNICODETEXT: u32 = 13;
+
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return false;
+        }
+        if EmptyClipboard() == 0 {
+            CloseClipboard();
+            return false;
+        }
+
+        // CF_UNICODETEXT 要求以 NUL 结尾，末尾补一个
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        wide.push(0);
+
+        let hmem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2);
+        if hmem.is_null() {
+            CloseClipboard();
+            return false;
+        }
+        let dst = GlobalLock(hmem) as *mut u16;
+        if dst.is_null() {
+            CloseClipboard();
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
+
+        GlobalUnlock(hmem);
+        SetClipboardData(CF_UNICODETEXT, hmem);
+        CloseClipboard();
+        true
+    }
+}
+
+/// 读剪贴板里的纯文本（CF_UNICODETEXT），供地址栏 Ctrl+V 使用。
+pub fn get_clipboard_text() -> Option<String> {
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    };
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+
+    const CF_UNICODETEXT: u32 = 13;
+
+    unsafe {
+        if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
+            return None;
+        }
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let handle = GetClipboardData(CF_UNICODETEXT);
+        let mut out = None;
+        if !handle.is_null() {
+            let src = GlobalLock(handle) as *const u16;
+            if !src.is_null() {
+                let mut len = 0usize;
+                while *src.add(len) != 0 {
+                    len += 1;
+                }
+                let slice = core::slice::from_raw_parts(src, len);
+                out = Some(String::from_utf16_lossy(slice));
+                GlobalUnlock(handle);
+            }
+        }
+        CloseClipboard();
+        out
+    }
+}
+
 /// 读剪贴板中的文件列表（用于粘贴）。
 pub fn get_clipboard_files() -> Vec<std::path::PathBuf> {
     use windows_sys::Win32::System::DataExchange::{
@@ -231,4 +378,73 @@ pub fn get_clipboard_files() -> Vec<std::path::PathBuf> {
         CloseClipboard();
     }
     out
+}
+
+// ------------------------------------------------------------------ 已知文件夹
+
+/// 系统已知文件夹（`KNOWNFOLDERID` 的一个子集）。
+///
+/// 不用 `%USERPROFILE%\Desktop` 这种拼法：桌面、文档、图片都可能被 OneDrive
+/// 或组策略重定向到别的卷，只有问 Shell 才拿得准。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownFolder {
+    /// 用户主文件夹。
+    Profile,
+    Desktop,
+    Downloads,
+    Documents,
+    Pictures,
+    Music,
+    Videos,
+}
+
+impl KnownFolder {
+    /// 对应的 `KNOWNFOLDERID` 值，取自 `KnownFolders.h`。
+    fn id(self) -> windows_sys::core::GUID {
+        use windows_sys::core::GUID;
+        match self {
+            KnownFolder::Profile => GUID::from_u128(0x5E6C858F_0E22_4760_9AFE_EA3317B67173),
+            KnownFolder::Desktop => GUID::from_u128(0xB4BFCC3A_DB2C_424C_B029_7FE99A87C641),
+            KnownFolder::Downloads => GUID::from_u128(0x374DE290_123F_4565_9164_39C4925E467B),
+            KnownFolder::Documents => GUID::from_u128(0xFDD39AD0_238F_46AF_ADB4_6C85480369C7),
+            KnownFolder::Pictures => GUID::from_u128(0x33E28130_4E1E_4676_835A_98395C3BC3BB),
+            KnownFolder::Music => GUID::from_u128(0x4BD8D571_6D19_48D3_BE97_422220080E43),
+            KnownFolder::Videos => GUID::from_u128(0x18989B1D_99B5_455B_841C_AB7C74E4DDFC),
+        }
+    }
+}
+
+/// 解析已知文件夹的绝对路径。失败返回 `None`。
+///
+/// 返回的内存由 `SHGetKnownFolderPath` 用 `CoTaskMemAlloc` 分配，
+/// 必须用 `CoTaskMemFree` 释放——这里在转换完成后立刻释放，不持有裸指针。
+pub fn known_folder(folder: KnownFolder) -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
+
+    let id = folder.id();
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    // KF_FLAG_DEFAULT = 0，当前用户令牌传 null
+    let hr = unsafe { SHGetKnownFolderPath(&id, 0, std::ptr::null_mut(), &mut raw) };
+    if hr < 0 || raw.is_null() {
+        return None;
+    }
+
+    // PWSTR 是 NUL 结尾的宽字符串，先量长度再切片
+    let mut len = 0usize;
+    unsafe {
+        while *raw.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let slice = unsafe { std::slice::from_raw_parts(raw, len) };
+    let path = std::path::PathBuf::from(crate::win::from_wide(slice));
+
+    unsafe { CoTaskMemFree(raw as *const core::ffi::c_void) };
+
+    if path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }

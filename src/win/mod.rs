@@ -6,6 +6,13 @@
 pub mod init;
 pub mod paint;
 pub mod wnd;
+pub mod dragdrop;
+pub mod droptarget;
+pub mod shellmenu;
+pub mod search;
+pub mod gdiplus;
+pub mod appicon;
+pub mod shortcut;
 
 use windows_sys::Win32::Foundation::HWND;
 

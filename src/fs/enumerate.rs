@@ -12,7 +12,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     WIN32_FIND_DATAW, FIND_FIRST_EX_LARGE_FETCH,
 };
 
-use super::entry::{filetime_from_parts, Entry, EntryKind, IconKey};
+use serde::{Deserialize, Serialize};
+
+use super::entry::{filetime_from_parts, Entry, EntryKind, IconKey, Volume};
 use crate::win::to_wide;
 use std::path::{Path, PathBuf};
 
@@ -21,7 +23,12 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
 /// 排序键。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 在一个类型上同时派生 serde：它既驱动排序，又是设置文件里的
+/// `sort_key` 字段；`cfg::settings` 直接 re-export 它，避免出现两个
+/// 同名但互不兼容的 `SortKey`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SortKey {
     Name,
     Size,
@@ -79,19 +86,26 @@ pub fn list_dir(dir: &Path, opts: &ListOptions) -> Result<Listing, String> {
         return Err(format!("路径不是目录：{}", dir.display()));
     }
 
-    // 构造 \\?\ 前缀避开 MAX_PATH 限制（长路径支持）
-    let pattern = match dir.to_str() {
+    // 构造 \\?\ 前缀避开 MAX_PATH 限制（长路径支持）。
+    //
+    // 注意：`\\?\` 前缀会**关掉系统对路径的规范化**，里面只能出现反斜杠。
+    // 地址栏手输、配置文件、从别处粘来的路径常常带 `/`，不先统一掉的话
+    // `\\?\C:/x/y/*` 会直接失败，整个文件夹看起来是空的。
+    let (pattern, dir_prefix) = match dir.to_str() {
         Some(s) if s.starts_with(r"\\") => {
             // UNC：\\?\UNC\server\share\*
-            let stripped = s.trim_start_matches('\\');
-            format!(r"\\?\UNC\{stripped}\*")
+            let stripped = s.trim_start_matches('\\').replace('/', "\\");
+            (
+                format!(r"\\?\UNC\{stripped}\*"),
+                format!(r"\\{stripped}\"),
+            )
         }
         Some(s) => {
-            let mut base = s.to_string();
-            if !base.ends_with('\\') && !base.ends_with('/') {
+            let mut base = s.replace('/', "\\");
+            if !base.ends_with('\\') {
                 base.push('\\');
             }
-            format!(r"\\?\{base}*")
+            (format!(r"\\?\{base}*"), base)
         }
         None => return Err("路径包含无法表示的字符".to_string()),
     };
@@ -113,14 +127,6 @@ pub fn list_dir(dir: &Path, opts: &ListOptions) -> Result<Listing, String> {
     if handle == INVALID_HANDLE_VALUE {
         return Err(format!("无法访问：{}", dir.display()));
     }
-
-    let dir_prefix = {
-        let mut s = dir.to_string_lossy().into_owned();
-        if !s.ends_with('\\') {
-            s.push('\\');
-        }
-        s
-    };
 
     // 预估容量：目录条目数常在 10~2000，先给 64 起步能减少多数扩容
     let mut entries: Vec<Entry> = Vec::with_capacity(64);
@@ -161,6 +167,14 @@ pub fn list_dir(dir: &Path, opts: &ListOptions) -> Result<Listing, String> {
                     data.ftLastWriteTime.dwLowDateTime,
                     data.ftLastWriteTime.dwHighDateTime,
                 );
+                let created = filetime_from_parts(
+                    data.ftCreationTime.dwLowDateTime,
+                    data.ftCreationTime.dwHighDateTime,
+                );
+                let accessed = filetime_from_parts(
+                    data.ftLastAccessTime.dwLowDateTime,
+                    data.ftLastAccessTime.dwHighDateTime,
+                );
 
                 // 跳过重解析点（符号链接/挂载点）的递归遍历风险由上层处理，
                 // 这里仅正常列出。
@@ -172,9 +186,13 @@ pub fn list_dir(dir: &Path, opts: &ListOptions) -> Result<Listing, String> {
                     kind,
                     size,
                     modified,
+                    created,
+                    accessed,
                     attrs,
                     type_name: String::new(),
                     icon_key: IconKey::Pending,
+                    // 容量只对驱动器有意义，普通枚举不查盘
+                    volume: None,
                 });
             }
         }
@@ -212,21 +230,66 @@ pub fn list_computer(opts: &ListOptions) -> Listing {
         };
         entries.push(Entry {
             name,
-            full: d,
+            full: d.clone(),
             kind: EntryKind::Drive,
             size: 0,
             modified: 0,
+            created: 0,
+            accessed: 0,
             attrs: FILE_ATTRIBUTE_DIRECTORY,
             type_name: "本地磁盘".to_string(),
             icon_key: IconKey::Drive,
+            volume: volume_of(&d),
         });
     }
-    sort_entries(&mut entries, &opts.sort);
+    // 「此电脑」固定按盘符字母顺序排，不跟随列表当前的排序方式——
+    // 资源管理器就是这个行为，盘符顺序也是找盘的第一直觉。
+    // 卷标各机器不同，按名字排会让 C/D/E 打乱成看似随机的次序。
+    entries.sort_by(|a, b| {
+        a.full
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .cmp(&b.full.to_string_lossy().to_ascii_uppercase())
+    });
+    let _ = opts;
     Listing { entries, skipped: 0 }
 }
 
+/// 查询驱动器容量。
+///
+/// 失败返回 `None` —— 空的光驱、断开的网络盘、无权限的 BitLocker 卷都会失败，
+/// 这是正常状态而不是错误：卡片上少一行容量文字即可，不该影响枚举。
+pub fn volume_of(drive: &Path) -> Option<Volume> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let root = to_wide(&drive.to_string_lossy());
+    let mut free_to_caller = 0u64;
+    let mut total = 0u64;
+    let mut total_free = 0u64;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            root.as_ptr(),
+            &mut free_to_caller,
+            &mut total,
+            &mut total_free,
+        )
+    };
+    if ok == 0 || total == 0 {
+        return None;
+    }
+    // 用 free_to_caller 而不是 total_free：前者已扣除磁盘配额，
+    // 与资源管理器显示的「可用」口径一致。
+    Some(Volume {
+        free: free_to_caller,
+        total,
+    })
+}
+
 /// 取驱动器卷标（失败返回空串）。
-fn drive_label(drive: &Path) -> String {
+///
+/// 导航窗格也要用它拼 `系统 (C:)`，所以公开。调用点在重绘路径上而非每帧，
+/// 且 `GetVolumeInformationW` 对已挂载卷有系统级缓存，开销可接受。
+pub fn drive_label(drive: &Path) -> String {
     use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
     let root = to_wide(&drive.to_string_lossy());
     let mut label = [0u16; 64];
@@ -297,4 +360,88 @@ pub fn sort_entries(entries: &mut [Entry], sort: &Sort) {
 /// 供 UI 线程直接调用的小工具：把 FILETIME 结构转 u64。
 pub fn ft64(ft: &FILETIME) -> u64 {
     filetime_from_parts(ft.dwLowDateTime, ft.dwHighDateTime)
+}
+
+// ---------------------------------------------------------------- 搜索结果
+
+/// 从绝对路径构造一条目录项。搜索命中走这里，失败返回 `None`。
+pub fn entry_from_path(path: &Path) -> Option<Entry> {
+    use std::os::windows::fs::MetadataExt;
+
+    let meta = std::fs::metadata(path).ok()?;
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+
+    let is_dir = meta.is_dir();
+    let is_lnk = !is_dir
+        && name.len() >= 4
+        && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".lnk");
+    let kind = if is_dir {
+        EntryKind::Directory
+    } else if is_lnk {
+        EntryKind::Shortcut
+    } else {
+        EntryKind::File
+    };
+
+    let written = meta.last_write_time();
+    Some(Entry {
+        full: path.to_path_buf(),
+        name,
+        kind,
+        size: if is_dir { 0 } else { meta.len() },
+        #[allow(clippy::cast_possible_truncation)]
+        modified: filetime_from_parts(written as u32, (written >> 32) as u32),
+        #[allow(clippy::cast_possible_truncation)]
+        created: filetime_from_parts(meta.creation_time() as u32, (meta.creation_time() >> 32) as u32),
+        #[allow(clippy::cast_possible_truncation)]
+        accessed: filetime_from_parts(meta.last_access_time() as u32, (meta.last_access_time() >> 32) as u32),
+        attrs: meta.file_attributes(),
+        type_name: String::new(),
+        icon_key: IconKey::Pending,
+        volume: None,
+    })
+}
+
+/// 索引不可用时的降级路径：在 `root` 子树内按文件名包含关系查找。
+///
+/// 语义与「资源管理器关掉索引后的搜索」一致——递归遍历。为避免 UI 卡死，
+/// 这里有硬上限：最多返回 `limit` 条、最多运行 `budget_ms` 毫秒，
+/// 且不跟随符号链接（防止目录环）。
+pub fn scan_subtree(root: &Path, key: &str, limit: usize, budget_ms: u32) -> Vec<Entry> {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount;
+
+    let needle = key.to_lowercase();
+    let start = unsafe { GetTickCount() };
+    let mut out: Vec<Entry> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        if out.len() >= limit || unsafe { GetTickCount() }.wrapping_sub(start) > budget_ms {
+            break;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in rd.flatten() {
+            if out.len() >= limit || unsafe { GetTickCount() }.wrapping_sub(start) > budget_ms {
+                break;
+            }
+            let Ok(ft) = item.file_type() else { continue };
+            let path = item.path();
+            let name = item.file_name().to_string_lossy().into_owned();
+
+            if name.to_lowercase().contains(&needle) {
+                if let Some(e) = entry_from_path(&path) {
+                    out.push(e);
+                }
+            }
+            if ft.is_dir() && !ft.is_symlink() {
+                stack.push(path);
+            }
+        }
+    }
+    out
 }

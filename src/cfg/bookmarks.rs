@@ -127,10 +127,42 @@ impl Bookmarks {
     }
 
     /// 按「置顶优先，其后保持插入序」排序后的迭代顺序。
+    /// 把第 `from` 个显示位（`ordered()` 的下标）移到第 `to` 个显示位。
+    ///
+    /// 直接按显示顺序重排 `items`：置顶项本来就在最前，重排后
+    /// `ordered()` 算出来的顺序和用户拖出来的完全一致，不会互相打架。
+    pub fn move_item(&mut self, from: usize, to: usize) -> bool {
+        let ord = self.ordered();
+        if from >= ord.len() || to > ord.len() || from == to {
+            return false;
+        }
+        let mut seq: Vec<Bookmark> = ord.iter().map(|&i| self.items[i].clone()).collect();
+        let item = seq.remove(from);
+        let at = to.min(seq.len());
+        seq.insert(at, item);
+        self.items = seq;
+        true
+    }
+
     pub fn ordered(&self) -> Vec<usize> {
         let mut idx: Vec<usize> = (0..self.items.len()).collect();
         idx.sort_by_key(|&i| !self.items[i].pinned);
         idx
+    }
+
+    // ---------------------------------------------------- 按「下标路径」访问
+    //
+    // 书签目录是可以嵌套的，而菜单里的每一项又要能精确回指到某一层。
+    // 用一条 `[顶层下标, 子下标, …]` 的路径代替单个下标：既不会把层级压平，
+    // 也不需要在每层都写一遍递归查找。
+
+    pub fn get(&self, path: &[usize]) -> Option<&Bookmark> {
+        let (first, rest) = path.split_first()?;
+        let mut cur = self.items.get(*first)?;
+        for &i in rest {
+            cur = cur.children.get(i)?;
+        }
+        Some(cur)
     }
 }
 

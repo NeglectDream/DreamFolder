@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Shell::{SHFileOperationW, SHFILEOPSTRUCTW};
 
-use crate::win::to_wide_raw;
+use crate::win::to_wide;
 
 // 操作码与标志（显式取值，不依赖常量导出）
 const FO_MOVE: u32 = 0x0001;
@@ -227,15 +227,18 @@ pub fn create_file(parent: &Path, base_name: &str, ext: &str) -> Result<PathBuf,
 }
 
 /// 在资源管理器中定位并选中该项目。
+///
+/// 三个参数都必须 NUL 结尾（`ShellExecuteW` 靠结尾 0 定界），
+/// 所以用 `to_wide` 而不是 `to_wide_raw`。
 pub fn reveal_in_explorer(path: &Path) -> bool {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     let arg = if path.is_dir() {
-        to_wide_raw(&path.to_string_lossy())
+        to_wide(&path.to_string_lossy())
     } else {
-        to_wide_raw(&format!("/select,\"{}\"", path.display()))
+        to_wide(&format!("/select,\"{}\"", path.display()))
     };
-    let verb = to_wide_raw("open");
-    let exe = to_wide_raw("explorer.exe");
+    let verb = to_wide("open");
+    let exe = to_wide("explorer.exe");
     let ret = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),

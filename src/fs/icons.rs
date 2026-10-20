@@ -22,6 +22,16 @@ const SHGFI_LARGEICON: u32 = 0x0000_0000;
 const SHGFI_SMALLICON: u32 = 0x0000_0001;
 const SHGFI_USEFILEATTRIBUTES: u32 = 0x0000_0010;
 const SHGFI_TYPENAME: u32 = 0x0000_0400;
+const SHGFI_PIDL: u32 = 0x0000_0008;
+const SHGFI_SYSICONINDEX: u32 = 0x0000_4000;
+
+/// 系统「超大」图像列表（256px）。
+const SHIL_JUMBO: i32 = 4;
+/// `ImageList_Draw` 的透明标志。
+const ILD_TRANSPARENT: u32 = 0x0000_0001;
+/// `IID_IImageList`。
+const IID_IIMAGE_LIST: windows_sys::core::GUID =
+    windows_sys::core::GUID::from_u128(0x46EB_5926_582E_4017_9FDF_E899_8DAA_0950);
 
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
@@ -91,17 +101,23 @@ impl IconCache {
             _ => {}
         }
 
+        // 先只读查缓存；命中即返回，避免与后面的可变借用重叠。
+        let cached = if size == IconSize::Small {
+            self.small.get(key)
+        } else {
+            self.large.get(key)
+        };
+        if let Some(&h) = cached {
+            return h as *mut core::ffi::c_void;
+        }
+
+        // 未命中：先查询（需要 &mut self），再写回所在表。
+        let h = self.query_by_key(key, size);
         let table = if size == IconSize::Small {
             &mut self.small
         } else {
             &mut self.large
         };
-
-        if let Some(&h) = table.get(key) {
-            return h as *mut core::ffi::c_void;
-        }
-
-        let h = self.query_by_key(key, size);
         table.insert(key.clone(), h as isize);
         h
     }
@@ -163,6 +179,20 @@ impl IconCache {
     /// 按扩展名查询图标（不访问磁盘）。
     fn query_by_key(&self, key: &IconKey, size: IconSize) -> *mut core::ffi::c_void {
         let (fake_name, attrs) = match key {
+            // 真实路径：已知文件夹、具体驱动器。属性不走 USEFILEATTRIBUTES，
+            // 这样 Shell 会去看「这个目录到底是什么」（下载/图片/音乐图标各不相同）。
+            IconKey::Path(path) => {
+                let w = to_wide(path);
+                let is_dir = Path::new(path).is_dir();
+                let attrs = if is_dir {
+                    FILE_ATTRIBUTE_DIRECTORY
+                } else {
+                    FILE_ATTRIBUTE_NORMAL
+                };
+                return unsafe { shell_icon(w.as_ptr(), attrs, size, false) };
+            }
+            // 虚拟项（此电脑/回收站/网络）没有路径，只能按 CSIDL 取 PIDL
+            IconKey::Special(id) => return special_icon(*id, size),
             IconKey::Ext(ext) => (format!("x.{ext}"), FILE_ATTRIBUTE_NORMAL),
             IconKey::NoExt => ("x".to_string(), FILE_ATTRIBUTE_NORMAL),
             _ => ("x".to_string(), FILE_ATTRIBUTE_NORMAL),
@@ -237,6 +267,18 @@ unsafe fn shell_icon(
     size: IconSize,
     use_attributes: bool,
 ) -> *mut core::ffi::c_void {
+    // 大图标优先取系统的 256px 版本。
+    //
+    // `SHGFI_LARGEICON` 只会给 32×32——界面按缩放比把它画到 96、144 甚至更大，
+    // 结果就是糊成一团，这正是「图标没有严格按比例放大」的观感来源。
+    // 系统本身有一份 256px 的图像列表，直接取来再缩小画，任何比例都清晰。
+    if size == IconSize::Large {
+        let big = jumbo_icon(path, attrs, use_attributes);
+        if !big.is_null() {
+            return big;
+        }
+    }
+
     let mut info: SHFILEINFOW = std::mem::zeroed();
     let mut flags = SHGFI_ICON;
     flags |= if size == IconSize::Small {
@@ -259,6 +301,98 @@ unsafe fn shell_icon(
         std::ptr::null_mut()
     } else {
         info.hIcon
+    }
+}
+
+/// 取 Shell 特殊项图标：0 = 此电脑，1 = 回收站，2 = 网络。
+///
+/// 走 `SHGetStockIconInfo`：这三个是系统自带的「库存图标」，
+/// 不用构造 PIDL，也就没有内存所有权问题——比 SHGetSpecialFolderLocation
+/// 那条路少一次跨进程分配，不会因为释放时机出错而崩。
+fn special_icon(id: u8, size: IconSize) -> *mut core::ffi::c_void {
+    use windows_sys::Win32::UI::Shell::{
+        SHGetStockIconInfo, SHSTOCKICONINFO, SHGSI_ICON, SHGSI_LARGEICON, SHGSI_SMALLICON,
+        SIID_DESKTOPPC, SIID_NETWORKCONNECT, SIID_RECYCLER,
+    };
+
+    let siid = match id {
+        0 => SIID_DESKTOPPC,
+        1 => SIID_RECYCLER,
+        _ => SIID_NETWORKCONNECT,
+    };
+    let mut flags = SHGSI_ICON;
+    flags |= if size == IconSize::Small {
+        SHGSI_SMALLICON
+    } else {
+        SHGSI_LARGEICON
+    };
+
+    unsafe {
+        let mut info: SHSTOCKICONINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<SHSTOCKICONINFO>() as u32;
+        if SHGetStockIconInfo(siid, flags, &mut info) < 0 || info.hIcon.is_null() {
+            return std::ptr::null_mut();
+        }
+        info.hIcon
+    }
+}
+
+/// 从系统 256px 图像列表里取一个图标。失败返回空指针，由调用方回退到 32px。
+///
+/// # Safety
+/// `path` 必须是 NUL 结尾的宽串指针。
+unsafe fn jumbo_icon(
+    path: *const u16,
+    attrs: u32,
+    use_attributes: bool,
+) -> *mut core::ffi::c_void {
+    use windows_sys::Win32::UI::Shell::SHGetImageList;
+
+    // 1) 先拿到图标在系统图像列表里的索引
+    let mut info: SHFILEINFOW = std::mem::zeroed();
+    let mut flags = SHGFI_SYSICONINDEX;
+    if use_attributes {
+        flags |= SHGFI_USEFILEATTRIBUTES;
+    }
+    let ret = SHGetFileInfoW(
+        path,
+        attrs,
+        &mut info,
+        std::mem::size_of::<SHFILEINFOW>() as u32,
+        flags,
+    );
+    if ret == 0 {
+        return std::ptr::null_mut();
+    }
+
+    // 2) 系统 JUMBO 图像列表
+    let mut himl: *mut core::ffi::c_void = std::ptr::null_mut();
+    if SHGetImageList(SHIL_JUMBO, &IID_IIMAGE_LIST, &mut himl) < 0 || himl.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    // 3) IImageList::GetIcon。IUnknown 三个方法之后依次是
+    //    Add / ReplaceIcon / SetOverlayImage / Replace / AddMasked / Draw / Remove / GetIcon，
+    //    因此 GetIcon 落在索引 10。
+    let vtbl = *(himl as *mut *const *const core::ffi::c_void);
+    let get_icon: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        i32,
+        u32,
+        *mut *mut core::ffi::c_void,
+    ) -> i32 = std::mem::transmute(*vtbl.add(10));
+    let mut hicon: *mut core::ffi::c_void = std::ptr::null_mut();
+    let hr = get_icon(himl, info.iIcon, ILD_TRANSPARENT, &mut hicon);
+
+    // 4) 释放图像列表。取出的 HICON 是独立对象，不受影响。
+    let release: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32 =
+        std::mem::transmute(*vtbl.add(2));
+    release(himl);
+
+    if hr < 0 {
+        std::ptr::null_mut()
+    } else {
+        hicon
     }
 }
 
@@ -317,22 +451,11 @@ pub fn app_icon() -> *mut core::ffi::c_void {
     unsafe { shell_icon(w.as_ptr(), FILE_ATTRIBUTE_NORMAL, IconSize::Large, false) }
 }
 
-/// 让窗口知道自己的图标（小图标用于标题栏）。
+/// 让窗口知道自己的图标（大 / 小 / 小2 三档）。
+///
+/// 图标由 `win::appicon` 从内嵌 logo 现算，这里只是转一次手：
+/// 以前是「拿 exe 路径去问 Shell 要图标」，而本项目没有 `.rc` 资源，
+/// 问出来的永远是系统默认图标。共享句柄，不要 `DestroyIcon`。
 pub fn apply_window_icons(hwnd: HWND) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_SETICON};
-    const ICON_SMALL: usize = 0;
-    const ICON_BIG: usize = 1;
-
-    let exe = std::env::current_exe().unwrap_or_default();
-    let w = to_wide(&exe.to_string_lossy());
-    unsafe {
-        let big = shell_icon(w.as_ptr(), FILE_ATTRIBUTE_NORMAL, IconSize::Large, false);
-        let small = shell_icon(w.as_ptr(), FILE_ATTRIBUTE_NORMAL, IconSize::Small, false);
-        if !big.is_null() {
-            SendMessageW(hwnd, WM_SETICON, ICON_BIG, big as isize);
-        }
-        if !small.is_null() {
-            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small as isize);
-        }
-    }
+    unsafe { crate::win::appicon::apply_to_window(hwnd) };
 }

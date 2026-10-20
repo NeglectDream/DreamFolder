@@ -48,7 +48,6 @@ tab_menu.xml           标签右键菜单
 option_menu.xml        显示选项子菜单
 view_menu.xml          视图模式菜单
 nav_records_menu.xml   历史记录菜单
-tray_menu.xml          托盘菜单
 favoriate_menu.xml            书签右键菜单
 favoriate_folder_menu.xml     书签目录右键菜单
 favoriate_container_menu.xml  书签容器菜单
@@ -161,7 +160,6 @@ reg add "HKU\.DEFAULT\Software\Classes\Folder\shell\newwindow\command" /ve /d "\
 | 单实例 + 命名管道唤醒 | [src/ipc.rs](src/ipc.rs) | 已实现 |
 | 接管系统文件管理 | [src/shell_integration.rs](src/shell_integration.rs) | 已实现 |
 | 拖放文件/文件夹 | [src/app.rs](src/app.rs) `on_drop_files` | 已实现 |
-| 托盘图标 | — | 待做 |
 | 自动更新 | — | 有意不做（见下） |
 | 引导页 | [src/strings.rs](src/strings.rs) `GUIDE_PAGES` | 文案就绪，界面待做 |
 | BHO 修复 | — | 不适用（本项目不装 BHO） |
@@ -232,14 +230,62 @@ reg add "HKU\.DEFAULT\Software\Classes\Folder\shell\newwindow\command" /ve /d "\
 
 - Rust stable ≥ 1.75（`rustup` 安装，或使用 RustRover 自带工具链）
 - Windows 10/11 x64
-- MSVC 目标（默认 `x86_64-pc-windows-msvc`）
+- **一个可用的链接器**（见下）
 
 无需任何额外系统库——只用 `windows-sys` 的原始 FFI 声明。
 
-### 构建命令
+### 链接器的选择（重要）
+
+Rust 在 Windows 上默认目标是 `x86_64-pc-windows-msvc`，它需要 MSVC 的
+`link.exe`（随「Visual Studio 生成工具」的 *C++ 生成工具* 工作负载安装）。
+只装了 Windows SDK 而没有 MSVC 编译器时，`cargo build` 会失败在
+`linking with link.exe failed`，而且**第一个卡住的往往不是自己的代码**——
+是 `serde_derive`/`quote` 这类构建脚本（它们用 host 工具链编译并链接）。
+
+两条出路，任选其一：
+
+**A. 装 MSVC 生成工具**（推荐；产物最小、无需附带运行时 DLL）
+
+```
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+```
+
+**B. 走 MinGW-GNU**（不装 VS 时用；本项目实测走的就是这条）
 
 ```powershell
-# 方式一：脚本
+rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+```
+
+注意 GNU 路线必须装 **toolchain** 而不是只加 target：只执行
+`rustup target add x86_64-pc-windows-gnu` 时，构建脚本仍然由 msvc 的 host
+工具链编译，一样会卡在 `link.exe`。
+
+### 项目路径不能含非 ASCII 字符（重要）
+
+MinGW 的 `ld.exe` 解析不了含中文的路径，会报一串：
+
+```
+ld.exe: cannot find D:\...\target\debug\deps\xxx.o: No such file or directory
+```
+
+而且它打印出来的路径本身也会变成乱码，很容易被误判成别的问题。
+
+**因此本项目必须放在纯 ASCII 路径下**——当前位于
+`D:\MineCraft\PluginsSrc\360folder-rs`。
+
+> 历史注记：项目早期位于 `E:\下载\360FileBrowser\360folder-rs`，当时靠
+> `CARGO_TARGET_DIR` 把构建目录重定向到 `C:\cargo-target\360folder` 绕过。
+> 迁移到 ASCII 路径后该 workaround 已移除，构建产物现在正常落在项目内的 `target\`。
+> 若以后要把项目搬回含中文的目录，需要重新加回这层重定向。
+
+### 构建命令
+
+只有一件事写在项目配置里：
+
+- [rust-toolchain.toml](rust-toolchain.toml) —— 固定使用 GNU 工具链（命令行与 RustRover 都会读）
+
+```powershell
+# 方式一：脚本（只负责找 cargo 并调用）
 .\build.ps1              # release 构建
 .\build.ps1 -Debug       # debug 构建
 .\build.ps1 -Run         # 构建并运行
@@ -249,11 +295,21 @@ reg add "HKU\.DEFAULT\Software\Classes\Folder\shell\newwindow\command" /ve /d "\
 cargo build --release
 ```
 
-产物：`target\release\360Folder.exe`
+产物：`target\release\360Folder.exe`（就在项目内）。
 
-### 在 RustRover 中
+在 RustRover 里直接 Build / Run 即可——它会读取 `rust-toolchain.toml`，不会再去找 `link.exe`。
+（验证方式：在项目目录下执行 `cargo -vV`，`host:` 一行应显示 `x86_64-pc-windows-gnu`。）
 
-直接用 IDE 的 Build / Run 即可。项目无 build script、无代码生成，标准 Cargo 工程。
+### 实测结果
+
+在本机（无 MSVC、MinGW-GNU 工具链）实际编译通过：
+
+| 配置 | 产物大小 |
+|---|---|
+| `--release` | **661 KB**（676,864 字节） |
+| 原版 `360FileBrowser.exe` | 2.4 MB（2,500,352 字节） |
+
+即体积约为原版的 **27%**。
 
 ---
 
@@ -311,7 +367,6 @@ Profile\
 - **搜索**：快速搜索（当前目录名称过滤）已实现；系统搜索需索引 API，网络搜索需 URL 模板配置
 
 ### 尚未实现
-- 托盘图标与托盘菜单
 - 历史记录下拉列表 UI
 - 导航窗格 / 预览窗格 / 详细信息窗格的实际绘制
 - 引导页
@@ -320,18 +375,27 @@ Profile\
 - 快捷键自定义 UI（数据层已就绪）
 - 排序表头点击切换
 
-### 关于「能否编译」
+### 编译状态
 
-本项目**未在编写环境中编译验证过**——该环境没有 Rust 工具链。
-代码在撰写时逐处核对了 `windows-sys 0.59` 的类型签名（`HWND`/`HDC` 为 `*mut c_void`，`VK_*` 为 `u16`，GDI 常量类型等），但没有编译器做过最终确认。
+本项目已在编写环境实际编译并链接通过：
 
-如果首次 `cargo build` 报错，最可能的几处是：
+- `cargo check` —— 0 错误、0 警告
+- `cargo build` / `cargo build --release` —— 产出可执行文件（见「五、构建 → 实测结果」）
 
-1. `windows-sys` 的 feature 名（[Cargo.toml](Cargo.toml)）—— 若某模块未导出，按编译器提示补 feature
-2. 个别导入路径（`Win32::UI::Shell` vs `Win32::UI::Shell::Common`）
-3. `CreateFontW` 等变参 API 的常量类型
+初版撰写时曾有两类系统性错误，均已修正，记录在此供后续排查参考：
 
-这些都是机械性修正，不涉及设计问题。
+1. **符号所在模块猜错**。`windows-sys` 的模块划分和 Win32 头文件的直觉不一致，例如
+   `InvalidateRect` / `UpdateWindow` / `BeginPaint` 都在 `Win32::Graphics::Gdi`
+   （不是 `WindowsAndMessaging`），`ReleaseCapture` 在 `Win32::UI::Input::KeyboardAndMouse`，
+   `PIPE_ACCESS_DUPLEX` 在 `Win32::Storage::FileSystem`，`HKEY` 在 `Win32::System::Registry`，
+   而 `WM_MOUSELEAVE` 竟然在 `Win32::UI::Controls`——漏掉它会让 `match msg` 里该分支
+   退化成变量绑定并吞掉后面所有分支（表现为一连串 `unreachable pattern` 警告）。
+2. **同名类型重复定义**。排序键一度在设置层和枚举层各有一份，两处不通用。
+   现已统一为 [src/fs/enumerate.rs](src/fs/enumerate.rs) 的单一 `SortKey`，
+   由 [src/cfg/settings.rs](src/cfg/settings.rs) 直接 re-export。
+
+若日后升级 `windows-sys` 后再次报导入错误，按编译器提示重新定位即可，
+都是机械性修正，不涉及设计问题。
 
 ---
 

@@ -24,7 +24,7 @@ pub fn roaming_profile() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("360Folder").join("Profile")
+    base.join("DreamFolder").join("Profile")
 }
 
 /// 选定的 Profile 目录。**只读判断**，不写盘。
@@ -49,20 +49,20 @@ pub fn profile_dir() -> PathBuf {
 
 /// 崩溃日志路径（程序目录优先，其次漫游目录）。
 pub fn crash_log() -> PathBuf {
-    let p = exe_dir().join("360folder-crash.log");
+    let p = exe_dir().join("dreamfolder-crash.log");
     if dir_writable(&exe_dir()) {
         return p;
     }
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("360Folder").join("360folder-crash.log")
+    base.join("DreamFolder").join("dreamfolder-crash.log")
 }
 
 /// 试探目录是否可写：创建一个临时文件再删掉。
 /// 只在选目录时调用一次，代价可接受。
 fn dir_writable(dir: &Path) -> bool {
-    let probe = dir.join(".360folder_write_probe");
+    let probe = dir.join(".dreamfolder_write_probe");
     match std::fs::File::create(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);

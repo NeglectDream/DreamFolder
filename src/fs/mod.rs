@@ -4,10 +4,12 @@ pub mod entry;
 pub mod enumerate;
 pub mod icons;
 pub mod ops;
+pub mod recycle;
 pub mod shell;
 
-pub use entry::{Entry, EntryKind};
-pub use enumerate::{list_dir, ListOptions, Sort, SortKey};
+/// 只 re-export 外部真正会用到的两个类型：
+/// `Sort`/`SortKey` 同时服务于枚举层与设置持久化层（见 `cfg::settings`）。
+pub use enumerate::{Sort, SortKey};
 
 use std::path::{Path, PathBuf};
 
@@ -127,6 +129,22 @@ pub fn clean_path(p: &Path) -> PathBuf {
     result
 }
 
+/// 去掉 `\\?\` / `\\?\UNC\` 前缀。
+///
+/// 枚举时为了突破 MAX_PATH 会给路径加 verbatim 前缀，但 Shell 那一侧
+/// （`ShellExecuteW`、`SHParseDisplayName`、`IContextMenu`）不接受这种写法，
+/// 直接传过去就以「找不到文件」告终。凡是交给 Shell 的路径都先过这一道。
+pub fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    p.to_path_buf()
+}
+
 /// 父目录（根目录返回 None）。
 pub fn parent_of(p: &Path) -> Option<PathBuf> {
     let cleaned = clean_path(p);
@@ -136,6 +154,23 @@ pub fn parent_of(p: &Path) -> Option<PathBuf> {
     } else {
         Some(parent.to_path_buf())
     }
+}
+
+/// 两个路径是否指向同一个位置。
+///
+/// 用来判断「这个目录是不是已经有一个标签开着」——同一目录的写法可能带/不带
+/// 末尾分隔符，大小写也可能不同，直接 `==` 会漏掉本该认定为重复的情况。
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    fn norm(p: &Path) -> String {
+        let s = p.to_string_lossy().replace('/', "\\");
+        let trimmed = s.trim_end_matches('\\').to_string();
+        if trimmed.is_empty() {
+            s
+        } else {
+            trimmed
+        }
+    }
+    norm(a).to_lowercase() == norm(b).to_lowercase()
 }
 
 /// 路径是否为驱动器根（`C:\`、`D:\`）。

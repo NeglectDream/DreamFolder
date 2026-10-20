@@ -1,0 +1,14 @@
+# 固定使用 MinGW-GNU 工具链。
+#
+# 原因：本机没有 MSVC 链接器（link.exe 不存在），而 Rust 默认的 msvc 目标
+# 在编译「构建脚本」时就要用它——所以第一个失败的往往是 proc-macro2 / quote /
+# serde_derive 这些依赖，而不是本项目自己的代码（错误形如：
+#   error: linker `link.exe` not found
+#   error: could not compile `proc-macro2` (build script)）。
+#
+# rustup 与 RustRover 都会读取本文件，因此这里写死后，IDE 里直接 Build 也能通过。
+#
+# 若你以后装了 Visual Studio 生成工具（勾选「使用 C++ 的桌面开发」），
+# 想换回体积更小的 msvc 目标，把下面这行 channel 改成 "stable" 即可。
+[toolchain]
+channel = "stable-x86_64-pc-windows-gnu"

@@ -48,7 +48,7 @@ impl AddrHistory {
             return;
         }
         let mut out = String::with_capacity(self.items.len() * 48);
-        out.push_str("; 360Folder 地址栏历史（可手改，每行一条）\r\n");
+        out.push_str("; DreamFolder 地址栏历史（可手改，每行一条）\r\n");
         for it in self.items.iter().take(MAX_ITEMS) {
             out.push_str("path=");
             out.push_str(it);

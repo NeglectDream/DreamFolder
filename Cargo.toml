@@ -1,14 +1,14 @@
 [package]
-name = "folder360"
+name = "dreamfolder"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "360文件夹 的 Rust 原生重写：多标签文件管理器，面向极致冷启动速度"
+description = "DreamFolder 的 Rust 原生重写：多标签文件管理器，面向极致冷启动速度"
 license = "MIT"
 readme = "README.md"
 
 [[bin]]
-name = "360Folder"
+name = "DreamFolder"
 path = "src/main.rs"
 
 # 说明：刻意使用 windows-sys（纯 FFI 绑定）而非 windows（COM 包装层）。
@@ -23,6 +23,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Controls",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_GdiPlus",
+    "Win32_Graphics_Dwm",
     "Win32_Storage_FileSystem",
     "Win32_System_Registry",
     "Win32_System_Threading",
@@ -34,7 +36,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Ole",
     "Win32_System_Com",
     "Win32_System_SystemServices",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_System_Environment",
     "Win32_System_ProcessStatus",
+    "Win32_Globalization",
     "Win32_Security",
 ] }
 serde = { version = "1", features = ["derive"] }
