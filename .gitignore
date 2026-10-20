@@ -1,0 +1,22 @@
+# ---- Rust 构建产物 ----
+/target/
+**/*.rs.bk
+*.pdb
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.iml
+*.swp
+*~
+
+# ---- 运行期生成的文件 ----
+# 与原软件同名，程序首次运行时会在 exe 同目录下生成 Profile\
+Profile/
+*.log
+360folder-crash.log
+
+# ---- 操作系统 ----
+Thumbs.db
+Desktop.ini
+.DS_Store

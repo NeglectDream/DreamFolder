@@ -1,0 +1,52 @@
+[package]
+name = "folder360"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "360文件夹 的 Rust 原生重写：多标签文件管理器，面向极致冷启动速度"
+license = "MIT"
+readme = "README.md"
+
+[[bin]]
+name = "360Folder"
+path = "src/main.rs"
+
+# 说明：刻意使用 windows-sys（纯 FFI 绑定）而非 windows（COM 包装层）。
+# 原因：无 Result/Param 包装、无泛型单态化膨胀，链接产物更小，冷启动更快。
+[dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Controls",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Com",
+    "Win32_System_SystemServices",
+    "Win32_System_ProcessStatus",
+    "Win32_Security",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ---- 冷启动优化：整个发布配置都为「小、快、无运行时」服务 ----
+[profile.release]
+opt-level = 3          # 全量优化
+lto = "fat"            # 跨 crate 内联，摊薄 FFI 边界
+codegen-units = 1      # 单编译单元，换取最优内联
+panic = "abort"        # 去掉 unwind 表
+strip = true           # 剥离符号
+incremental = false
+overflow-checks = false
+debug-assertions = false
