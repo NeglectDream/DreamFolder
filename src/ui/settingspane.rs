@@ -14,8 +14,8 @@ use crate::win::paint::{rect, rect_contains};
 
 /// 面板宽（逻辑像素）。
 const PANEL_W: i32 = 520;
-/// 面板高。
-const PANEL_H: i32 = 520;
+/// 面板高：头部 + 13 行 + 上下余量。
+const PANEL_H: i32 = 658;
 /// 一行的高度。
 const ROW_H: i32 = 44;
 /// 面板内边距。
@@ -33,10 +33,16 @@ pub enum Id {
     Toolbar,
     NavPane,
     DetailPane,
+    /// 详情窗格里标签模块排在文件明细上方。
+    TagsFirst,
     Extensions,
     Hidden,
     DbClickParent,
     CtrlDbClickTab,
+    /// 多标签关窗前弹确认框。
+    CloseAlert,
+    /// 禁用除基础导航外的所有快捷键。
+    Hotkeys,
     /// 深色模式。
     Theme,
     /// 不是开关，而是五档滑块。
@@ -50,16 +56,19 @@ pub struct Item {
 }
 
 /// 面板里的全部行，顺序即显示顺序。
-pub const ITEMS: [Item; 10] = [
+pub const ITEMS: [Item; 13] = [
     Item { label: "深色模式", id: Id::Theme },
     Item { label: "显示书签栏", id: Id::Favbar },
     Item { label: "显示工具栏", id: Id::Toolbar },
     Item { label: "显示导航窗格", id: Id::NavPane },
     Item { label: "显示详细信息窗格", id: Id::DetailPane },
+    Item { label: "标签排在明细上方", id: Id::TagsFirst },
     Item { label: "显示文件扩展名", id: Id::Extensions },
     Item { label: "显示隐藏文件", id: Id::Hidden },
     Item { label: "双击空白返回上级", id: Id::DbClickParent },
     Item { label: "Ctrl+双击在新标签打开", id: Id::CtrlDbClickTab },
+    Item { label: "多标签关闭时确认", id: Id::CloseAlert },
+    Item { label: "禁用所有快捷键", id: Id::Hotkeys },
     Item { label: "界面缩放", id: Id::UiScale },
 ];
 
@@ -80,7 +89,7 @@ pub fn panel_rect(app: &Application) -> RECT {
     rect(x, y, x + w, y + h)
 }
 
-/// 一行的高度。面板被夹小之后行高跟着压缩，保证 9 行始终放得下。
+/// 一行的高度。面板被夹小之后行高跟着压缩，保证所有行始终放得下。
 fn row_h(app: &Application) -> i32 {
     let s = |v: i32| (v as f32 * app.layout.scale).round() as i32;
     let p = panel_rect(app);
@@ -217,10 +226,13 @@ pub fn value_of(app: &Application, id: Id) -> bool {
         Id::Toolbar => s.toolbar_visible,
         Id::NavPane => s.show_nav_pane,
         Id::DetailPane => s.show_detail_pane,
+        Id::TagsFirst => s.detail_tags_first,
         Id::Extensions => s.show_extension,
         Id::Hidden => s.show_hidden,
         Id::DbClickParent => s.dbclick_to_parent,
         Id::CtrlDbClickTab => s.ctrl_dbclick_open_righttab,
+        Id::CloseAlert => s.close_alter,
+        Id::Hotkeys => s.disable_all_hotkeys,
         Id::Theme => s.theme == crate::cfg::settings::ThemeKind::Dark,
         Id::UiScale => false, // 滑块没有布尔值
     }
@@ -235,10 +247,13 @@ pub fn toggle(app: &mut Application, id: Id) {
             Id::Toolbar => s.toolbar_visible = !s.toolbar_visible,
             Id::NavPane => s.show_nav_pane = !s.show_nav_pane,
             Id::DetailPane => s.show_detail_pane = !s.show_detail_pane,
+            Id::TagsFirst => s.detail_tags_first = !s.detail_tags_first,
             Id::Extensions => s.show_extension = !s.show_extension,
             Id::Hidden => s.show_hidden = !s.show_hidden,
             Id::DbClickParent => s.dbclick_to_parent = !s.dbclick_to_parent,
             Id::CtrlDbClickTab => s.ctrl_dbclick_open_righttab = !s.ctrl_dbclick_open_righttab,
+            Id::CloseAlert => s.close_alter = !s.close_alter,
+            Id::Hotkeys => s.disable_all_hotkeys = !s.disable_all_hotkeys,
             Id::Theme => {
                 s.theme = match s.theme {
                     crate::cfg::settings::ThemeKind::Dark => crate::cfg::settings::ThemeKind::Light,

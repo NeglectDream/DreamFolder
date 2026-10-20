@@ -74,15 +74,6 @@ impl Grid {
         rect(l, t, l + self.cell_w - self.gap, t + self.cell_h - self.gap)
     }
 
-    /// 内容总高度，用于算滚动范围。
-    pub fn content_height(&self, count: usize) -> i32 {
-        if count == 0 {
-            return 0;
-        }
-        let rows = count.div_ceil(self.cols) as i32;
-        self.top + rows * self.cell_h - self.gap
-    }
-
     /// 坐标落在哪张卡片上。空隙里返回 `None`。
     pub fn card_at(&self, x: i32, y: i32, count: usize, scroll_y: i32) -> Option<usize> {
         if y < self.top || x < self.left || x >= self.right {

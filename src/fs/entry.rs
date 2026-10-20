@@ -14,8 +14,6 @@ pub enum EntryKind {
     Drive,
     /// 快捷方式（.lnk）
     Shortcut,
-    /// 回收站等虚拟项
-    Virtual,
 }
 
 /// 驱动器容量。只有 `EntryKind::Drive` 会填；查询失败时留 `None`，
@@ -42,15 +40,6 @@ impl Volume {
     pub fn text(&self) -> String {
         format!(
             "{} 可用，共 {}",
-            format_capacity(self.free),
-            format_capacity(self.total)
-        )
-    }
-
-    /// 紧凑文案：`53.6 GB / 200 GB`，导航窗格那一条窄行放得下。
-    pub fn short_text(&self) -> String {
-        format!(
-            "{} / {}",
             format_capacity(self.free),
             format_capacity(self.total)
         )
@@ -84,8 +73,6 @@ pub struct Entry {
     pub created: u64,
     /// 最后访问时间。语义同 `modified`。
     pub accessed: u64,
-    /// Win32 文件属性位。
-    pub attrs: u32,
     /// 类型描述（如"文本文档"），由 icons 模块填充；空表示尚未取到。
     pub type_name: String,
     /// 图标缓存键，由 icons 模块填充。
@@ -142,10 +129,15 @@ impl Entry {
         matches!(self.kind, EntryKind::Directory | EntryKind::Drive)
     }
 
-    pub fn is_hidden(&self) -> bool {
-        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-        const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
-        self.attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
+    /// 是否是可解码成缩略图的图片文件。
+    ///
+    /// 按 GDI+ 内置编解码器的格式圈白名单；SVG 这类矢量格式不在其中，
+    /// 交给扩展名图标，别拿解码失败去浪费一次后台请求。
+    pub fn is_image(&self) -> bool {
+        matches!(
+            self.ext().as_str(),
+            "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tif" | "tiff" | "webp" | "ico"
+        )
     }
 
     /// 人类可读的大小。目录与驱动器返回空串（资源管理器同款行为）。
@@ -297,4 +289,83 @@ pub fn filetime_to_local_text(ft: u64) -> String {
 /// FILETIME 中的 64 位值拆解。
 pub fn filetime_from_parts(low: u32, high: u32) -> u64 {
     ((high as u64) << 32) | (low as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(name: &str) -> Entry {
+        Entry {
+            name: name.to_string(),
+            full: PathBuf::from(format!("C:/dir/{name}")),
+            kind: EntryKind::File,
+            size: 0,
+            modified: 0,
+            created: 0,
+            accessed: 0,
+            type_name: String::new(),
+            icon_key: IconKey::Pending,
+            volume: None,
+        }
+    }
+
+    fn dir(name: &str) -> Entry {
+        Entry { kind: EntryKind::Directory, ..file(name) }
+    }
+
+    /// 大小文案按 1024 进制换算，各档都带单位。
+    #[test]
+    fn format_size_units() {
+        assert_eq!(format_size(0), "0 字节");
+        assert_eq!(format_size(999), "999 字节");
+        assert_eq!(format_size(1024), "1.0 KB");
+        assert_eq!(format_size(1024 * 1024), "1.0 MB");
+        assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.00 GB");
+        assert_eq!(format_size(2 * 1024u64.pow(4)), "2.00 TB");
+    }
+
+    /// 目录与驱动器的「大小」是空串（资源管理器同款）。
+    #[test]
+    fn directories_have_no_size_text() {
+        assert_eq!(dir("Documents").size_text(), "");
+        let drive = Entry { kind: EntryKind::Drive, ..file("C:\\") };
+        assert_eq!(drive.size_text(), "");
+        assert_eq!(file("a.txt").size_text(), "0 字节");
+    }
+
+    /// 扩展名取最后一段且小写；目录恒为空。
+    #[test]
+    fn extension_is_lowercase_and_last_segment() {
+        assert_eq!(file("A.TXT").ext(), "txt");
+        assert_eq!(file("archive.tar.gz").ext(), "gz");
+        assert_eq!(file("README").ext(), "");
+        assert_eq!(dir("folder.txt").ext(), "");
+    }
+
+    /// 显示名按设置隐藏已知扩展名，但目录名从不裁剪。
+    #[test]
+    fn display_name_respects_setting() {
+        assert_eq!(file("a.txt").display_name(false), "a");
+        assert_eq!(file("a.txt").display_name(true), "a.txt");
+        assert_eq!(file("noext").display_name(false), "noext");
+        // 点开头的文件：点在最前面，不当扩展名分隔符
+        assert_eq!(file(".gitignore").display_name(false), ".gitignore");
+        assert_eq!(dir("a.txt").display_name(false), "a.txt");
+    }
+
+    /// FILETIME 拆解与合成互为逆运算。
+    #[test]
+    fn filetime_parts_roundtrip() {
+        let v = 0x0123_4567_89AB_CDEFu64;
+        assert_eq!(filetime_from_parts(v as u32, (v >> 32) as u32), v);
+    }
+
+    /// 时间为 0 表示「未知」，文案是空串而不是 1601 年。
+    #[test]
+    fn zero_time_is_empty() {
+        assert_eq!(file("a.txt").modified_text(), "");
+        assert_eq!(file("a.txt").created_text(), "");
+        assert_eq!(file("a.txt").accessed_text(), "");
+    }
 }

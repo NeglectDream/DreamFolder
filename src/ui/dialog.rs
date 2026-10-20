@@ -52,6 +52,8 @@ pub enum DialogIntent {
     RenameTag(usize),
     /// 删除第 N 个标签（只删归类，不动磁盘上的东西）。
     RemoveTag(usize),
+    /// 多标签关窗确认通过：真正关掉窗口（见 `request_close`）。
+    ExitApp,
 }
 
 /// 标签预设色（`#RRGGBB`，绘制前转成 COLORREF）。
@@ -138,11 +140,7 @@ impl Dialog {
         }
     }
 
-    /// 输入框里的文本按字符下标取光标前/后的部分。
-    pub fn input_chars(&self) -> Vec<char> {
-        self.input.chars().collect()
-    }
-
+    /// 是否是带输入框的对话框。
     pub fn has_input(&self) -> bool {
         self.kind == DialogKind::Prompt
     }
@@ -194,12 +192,6 @@ fn panel_width(app: &Application) -> i32 {
     s(app, base).min((cw - margin * 2).max(s(app, 240)))
 }
 
-/// 面板矩形（居中）。
-pub fn panel_rect(app: &Application) -> RECT {
-    let p = parts(app);
-    p.panel
-}
-
 /// 对话框的各个矩形。绘制与命中共用。
 pub struct Parts {
     pub panel: RECT,
@@ -209,7 +201,6 @@ pub struct Parts {
     pub input: RECT,
     /// 颜色环所在的整行（无颜色行时是空矩形）。
     pub colors: RECT,
-    pub buttons: RECT,
 }
 
 /// 计算全部矩形。
@@ -290,10 +281,6 @@ pub fn parts(app: &Application) -> Parts {
     };
     let _ = cy;
 
-    let bh = s(app, BTN_H);
-    let by = panel.bottom - pad - bh;
-    let buttons = rect(panel.left + pad, by, panel.right - pad, by + bh);
-
     Parts {
         panel,
         title,
@@ -301,7 +288,6 @@ pub fn parts(app: &Application) -> Parts {
         label,
         input,
         colors,
-        buttons,
     }
 }
 

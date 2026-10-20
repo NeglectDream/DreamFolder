@@ -5,7 +5,9 @@ pub mod enumerate;
 pub mod icons;
 pub mod ops;
 pub mod recycle;
+pub mod search;
 pub mod shell;
+pub mod thumbs;
 
 /// 只 re-export 外部真正会用到的两个类型：
 /// `Sort`/`SortKey` 同时服务于枚举层与设置持久化层（见 `cfg::settings`）。

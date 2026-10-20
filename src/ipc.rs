@@ -1,7 +1,8 @@
 //! 单实例与进程间通信。
 //!
 //! 与原软件一致使用命名管道：`\\.\pipe\dreamfolderpipe`（见 PE 字符串）。
-//! 第二个实例把「打开哪个路径 / 要不要新窗口」投递给已在运行的实例，然后退出。
+//! 第二个实例把「打开哪个路径」投递给已在运行的实例，然后退出；
+//! 现有实例像浏览器那样把路径并成**一个新标签**，而不是覆盖当前标签。
 //!
 //! ## 为什么服务端必须用重叠 I/O
 //!
@@ -70,14 +71,14 @@ pub fn route_to_existing(args: &CommandLine) -> RouteResult {
         return RouteResult::NoServer;
     }
 
-    // 报文格式：PATH\nNEWTAB\n  以 UTF-8 传输
+    // 报文格式：PATH\n  以 UTF-8 传输
+    // 路径为空表示「只把窗口唤到前台」（无参二次启动）
     let payload = format!(
-        "{}\n{}\n",
+        "{}\n",
         args.path
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        if args.new_window { "1" } else { "0" }
+            .unwrap_or_default()
     );
     let bytes = payload.as_bytes();
 
@@ -257,14 +258,11 @@ impl Drop for PipeServer {
     }
 }
 
-/// 解析投递来的报文。
-pub fn parse_message(msg: &str) -> (Option<std::path::PathBuf>, bool) {
-    let mut lines = msg.lines();
-    let path = lines
+/// 解析投递来的报文：一条路径（空行表示无路径，只唤前台）。
+pub fn parse_message(msg: &str) -> Option<std::path::PathBuf> {
+    msg.lines()
         .next()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from);
-    let new_tab = lines.next().map(|s| s.trim() == "1").unwrap_or(false);
-    (path, new_tab)
+        .map(std::path::PathBuf::from)
 }

@@ -20,7 +20,7 @@ use windows_sys::Win32::Graphics::GdiPlus::{
     GdipCreateBitmapFromStream, GdipCreateFromHDC, GdipCreateHICONFromBitmap, GdipDeleteGraphics,
     GdipDisposeImage, GdipDrawImageRectI, GdipGetImageGraphicsContext, GdipGetImageHeight,
     GdipGetImageWidth, GdipGraphicsClear, GdipSetInterpolationMode, GdipSetPixelOffsetMode,
-    GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GdiplusStartupOutput, BitmapData,
+    GdiplusStartup, GdiplusStartupInput, GdiplusStartupOutput, BitmapData,
     GpBitmap, GpGraphics, GpImage, ImageLockModeRead, InterpolationModeHighQualityBicubic,
     PixelOffsetModeHighQuality, Rect,
 };
@@ -71,15 +71,6 @@ pub fn ensure_init() -> bool {
     // 竞态下可能别的线程先 set 了，用哪个 token 都能工作，忽略返回值。
     let _ = TOKEN.set(token);
     true
-}
-
-/// 进程退出时释放 GDI+。当前入口不会主动调——进程结束时系统会清理，
-/// 而显式 shutdown 反而容易在析构顺序上踩到已释放的位图。留着给
-/// 需要「干净卸载」的调用方。
-pub fn shutdown() {
-    if let Some(token) = TOKEN.get().copied() {
-        unsafe { GdiplusShutdown(token) };
-    }
 }
 
 /// 一张已解码的位图。`Drop` 时释放 GDI+ 对象。
@@ -136,60 +127,6 @@ impl Image {
         let mut h: u32 = 0;
         unsafe { GdipGetImageHeight(self.raw as *mut GpImage, &mut h) };
         h as i32
-    }
-
-    /// 等比缩放到 `bounds` 内并居中绘制（不拉伸变形）。
-    ///
-    /// # Safety
-    /// `hdc` 必须是有效的设备上下文；`bounds` 的宽高应大于 0。
-    pub unsafe fn draw_fit(&self, hdc: HDC, bounds: RECT) {
-        self.draw_at(hdc, bounds, true);
-    }
-
-    /// 铺满 `bounds` 绘制（允许变形）。
-    ///
-    /// # Safety
-    /// 同 `draw_fit`。
-    pub unsafe fn draw_fill(&self, hdc: HDC, bounds: RECT) {
-        self.draw_at(hdc, bounds, false);
-    }
-
-    unsafe fn draw_at(&self, hdc: HDC, bounds: RECT, keep_aspect: bool) {
-        let bw = bounds.right - bounds.left;
-        let bh = bounds.bottom - bounds.top;
-        if bw <= 0 || bh <= 0 || !ensure_init() {
-            return;
-        }
-        let mut g: *mut GpGraphics = std::ptr::null_mut();
-        if GdipCreateFromHDC(hdc, &mut g) != 0 || g.is_null() {
-            return;
-        }
-        GdipSetInterpolationMode(g, InterpolationModeHighQualityBicubic);
-        GdipSetPixelOffsetMode(g, PixelOffsetModeHighQuality);
-
-        let (x, y, w, h) = if keep_aspect {
-            let (iw, ih) = (self.width().max(1), self.height().max(1));
-            // 用 i64 算中间值：4K 位图 × 大矩形时 i32 会溢出。
-            let by_width = (bw as i64, (bh as i64 * iw as i64) / ih as i64);
-            let by_height = ((bw as i64 * ih as i64) / iw as i64, bh as i64);
-            // 取「更扁」的那一组：宽的缩放结果高不超过 bh 就用它。
-            let (dw, dh) = if by_width.1 <= bh as i64 {
-                by_width
-            } else {
-                by_height
-            };
-            (
-                bounds.left + ((bw as i64 - dw) / 2) as i32,
-                bounds.top + ((bh as i64 - dh) / 2) as i32,
-                dw.max(1) as i32,
-                dh.max(1) as i32,
-            )
-        } else {
-            (bounds.left, bounds.top, bw, bh)
-        };
-
-        GdipDrawImageRectI(g, self.raw as *mut GpImage, x, y, w, h);
-        GdipDeleteGraphics(g);
     }
 
     /// 生成 `side × side` 的正方形缩放副本（源图等比缩放后居中，四周透明）。
@@ -320,25 +257,6 @@ impl Image {
         };
         unsafe { GdipDeleteGraphics(g) };
         status == 0
-    }
-
-    /// 转成 `HICON`。调用方负责 `DestroyIcon`。
-    pub fn to_hicon(&self) -> HICON {
-        if !ensure_init() {
-            return std::ptr::null_mut();
-        }
-        let mut icon: HICON = std::ptr::null_mut();
-        let status = unsafe { GdipCreateHICONFromBitmap(self.raw, &mut icon) };
-        if status != 0 {
-            std::ptr::null_mut()
-        } else {
-            icon
-        }
-    }
-
-    /// 原始 GDI+ 句柄（给需要自己调 `Gdip*` 的调用方）。
-    pub fn raw(&self) -> *mut GpBitmap {
-        self.raw
     }
 }
 

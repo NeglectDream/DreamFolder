@@ -5,35 +5,47 @@
 
 use  std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetDC, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, ReleaseDC,
     UpdateWindow, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
-use windows_sys::Win32::System::Environment::GetCommandLineW;
 // WM_MOUSELEAVE 在 windows-sys 里归到 UI::Controls，不在 WindowsAndMessaging。
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
-use windows_sys::Win32::UI::Shell::{
-    CommandLineToArgvW, DragAcceptFiles, DragFinish, DragQueryFileW,
-};
+use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::cfg::settings::{self, StartMode, ThemeKind, ViewMode};
 use crate::cfg::Config;
 use crate::fs::entry::{Entry, EntryKind};
-use crate::fs::enumerate::{self, ListOptions};
+use crate::fs::enumerate::ListOptions;
 use crate::fs::icons::IconCache;
 use crate::fs::icons::IconSize;
-use crate::fs::{self, ops, shell, Sort};
+use crate::fs::{self, ops as fsops, shell, Sort};
 use crate::ipc::PipeServer;
 use crate::strings as S;
 use crate::ui::{self, draw, interact, Layout};
 use crate::win::paint::{BackBuffer, Canvas, FontCache, Palette};
-use crate::win::{droptarget, from_wide, hwnd_valid, module_handle, to_wide, wnd};
+use crate::win::{
+    droptarget, from_wide, hwnd_valid, module_handle, to_wide, wnd as winwnd,
+};
+
+use crate::io::{Job, ListKind, OpWhat};
+
+mod cli;
+mod edit;
+mod ops;
+mod search;
+mod wnd;
+
+use wnd::{default_window_size, wnd_proc};
+
+pub use cli::CommandLine;
 
 /// 窗口类名。
 const CLASS_NAME: &str = "DreamFolder_Frame";
@@ -74,6 +86,21 @@ const TIMER_PIPE: usize = 1;
 const TIMER_CARET: usize = 2;
 /// 定时器 ID：工具栏悬停提示。一次性的——响过之后就 KillTimer。
 const TIMER_HOVER: usize = 3;
+/// 定时器 ID：搜索超时。一次性。
+const TIMER_SEARCH: usize = 4;
+/// 定时器 ID：状态栏瞬态提示（如「已复制路径」）。一次性。
+const TIMER_NOTE: usize = 5;
+/// 状态栏提示停留多久。
+const NOTE_MS: u32 = 3000;
+/// 搜索结果上限。搜索是「找得到就行」，不做全量列举。
+const SEARCH_LIMIT: usize = 500;
+/// 递归扫描的时间预算，超时就用已扫到的部分。
+const SCAN_BUDGET_MS: u32 = 400;
+/// 最多等搜索多久。系统索引查询本身没有超时，索引服务无响应时
+/// 界面不能一直停在「正在搜索…」。
+const SEARCH_TIMEOUT_MS: u32 = 8000;
+/// 地址栏历史下拉最多列几条。多到超过这个数就不如让用户接着打字了。
+pub const ADDR_SUGGEST_MAX: usize = 8;
 /// 悬停多久才出提示条（毫秒）。
 ///
 /// 500ms 是 Windows 自己的默认值（`SPI_GETMOUSEHOVERTIME`）：再短，
@@ -88,116 +115,6 @@ const NAV_MSG: u32 = 0x8000 + 11;
 /// 「此电脑」伪路径：空路径代表驱动器列表视图。
 pub const COMPUTER_VIEW: &str = "";
 
-// ------------------------------------------------------------------ 命令行
-
-/// 命令行开关。全部来自原软件 PE 字符串中的实际参数。
-#[derive(Debug, Clone, Default)]
-pub struct CommandLine {
-    /// 要打开的路径（裸参数）。
-    pub path: Option<PathBuf>,
-    /// `/OpenInNewWindow` —— 强制新窗口，不做单实例投递。
-    pub new_window: bool,
-    /// `/lowrun` —— 低优先级启动（原软件用于开机自启场景）。
-    pub low_run: bool,
-    /// `/autorun` —— 随系统启动。
-    pub autorun: bool,
-    /// `/replace_explorer_all` —— 接管资源管理器后退出。
-    pub replace_explorer_all: bool,
-    /// `/restore_explorer_all` —— 恢复资源管理器后退出。
-    pub restore_explorer_all: bool,
-    /// `/method=search /searchkey="..."` —— 直接发起搜索。
-    pub search_key: Option<String>,
-    /// `/curdir="..."` —— 启动目录。
-    pub cur_dir: Option<PathBuf>,
-    /// `/from=...` —— 来源标记（其余产品唤起）。
-    pub from: Option<String>,
-}
-
-impl CommandLine {
-    /// 解析真实命令行。使用 `GetCommandLineW` 以避免 ANSI 代码页损失。
-    pub fn parse() -> CommandLine {
-        let argv = raw_argv();
-        let mut cl = CommandLine::default();
-
-        let mut i = 1usize; // 跳过 exe 自身
-        while i < argv.len() {
-            let a = &argv[i];
-            let lower = a.to_ascii_lowercase();
-
-            if lower == "/openinnewwindow" {
-                cl.new_window = true;
-            } else if lower == "/lowrun" {
-                cl.low_run = true;
-            } else if lower == "/autorun" {
-                cl.autorun = true;
-            } else if lower == "/replace_explorer_all" {
-                cl.replace_explorer_all = true;
-            } else if lower == "/restore_explorer_all" {
-                cl.restore_explorer_all = true;
-            } else if let Some(v) = strip_prefix_ci(a, "/method=") {
-                // 仅识别 search；其它方法暂未使用
-                let _ = v;
-            } else if let Some(v) = strip_prefix_ci(a, "/searchkey=") {
-                cl.search_key = Some(unquote(v));
-            } else if let Some(v) = strip_prefix_ci(a, "/curdir=") {
-                cl.cur_dir = Some(PathBuf::from(unquote(v)));
-            } else if let Some(v) = strip_prefix_ci(a, "/from=") {
-                cl.from = Some(v.to_string());
-            } else if a.starts_with('/') {
-                // 未知开关：忽略（保持向前兼容）
-            } else {
-                // 裸路径参数
-                let p = unquote(a);
-                if !p.is_empty() {
-                    cl.path = fs::resolve_path(&p);
-                }
-            }
-            i += 1;
-        }
-
-        cl
-    }
-}
-
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
-}
-
-fn unquote(s: &str) -> String {
-    s.trim().trim_matches('"').to_string()
-}
-
-/// 取原始命令行参数（UTF-16 → String）。
-fn raw_argv() -> Vec<String> {
-    unsafe {
-        let cmd = GetCommandLineW();
-        let mut argc = 0i32;
-        let argv_ptr = CommandLineToArgvW(cmd, &mut argc);
-        if argv_ptr.is_null() {
-            return Vec::new();
-        }
-        let mut out = Vec::with_capacity(argc as usize);
-        for i in 0..argc {
-            let p = *argv_ptr.add(i as usize);
-            out.push(from_wide_ptr_safe(p));
-        }
-        LocalFree(argv_ptr as *mut core::ffi::c_void);
-        out
-    }
-}
-
-unsafe fn from_wide_ptr_safe(p: *const u16) -> String {
-    crate::win::from_wide_ptr(p)
-}
-
-#[allow(non_snake_case)] // 沿用 Win32 原名，便于与 MSDN 对照
-unsafe fn LocalFree(p: *mut core::ffi::c_void) {
-    let _ = windows_sys::Win32::Foundation::LocalFree(p);
-}
 
 // ------------------------------------------------------------------ 状态
 
@@ -209,17 +126,6 @@ pub struct Modifiers {
     pub alt: bool,
 }
 
-/// 搜索模式（对应搜索框左侧的三段切换）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchMode {
-    /// 快速搜索：在当前目录下按名称过滤
-    Quick,
-    /// 系统搜索：调用 Windows 搜索索引
-    System,
-    /// 网络搜索：交给默认浏览器
-    Web,
-}
-
 /// 搜索进行到哪了。
 ///
 /// 只在前端体现，不影响搜索本身怎么做：有了它，「正在搜」和「搜完了但没有」
@@ -229,10 +135,13 @@ pub enum SearchMode {
 pub enum SearchState {
     /// 输入框里有词，但还没按回车
     Pending,
-    /// 正在搜索（同步执行，期间界面只刷一帧「正在搜索…」）
+    /// 正在搜索（后台线程执行，见 `io::Job::Search`）
     Running,
     /// 搜索已结束，`hits` 是命中的条目数
     Done { hits: usize },
+    /// 超过等待上限还没回来。多半是索引服务没响应——此时后台线程可能还挂着，
+    /// 结果真回来了仍会被采纳（见 `on_io`）。
+    TimedOut,
 }
 
 /// 一个标签页。
@@ -258,6 +167,26 @@ pub struct Tab {
     pub error: Option<String>,
     /// 排序（每标签独立）。
     pub sort: Sort,
+    /// 目录枚举完成后要选中的文件名。
+    ///
+    /// 枚举移到了后台，所以「导航到某文件并在列表里选中它」没法立刻做完：
+    /// 先记下名字，等结果回来再落地（见 `Application::on_io`）。
+    pub pending_select: Option<String>,
+    /// 驱动器的卷标与容量（「此电脑」视图用）。后台补查后回填。
+    pub drive_info: Vec<crate::io::DriveInfo>,
+
+    // ---- 搜索（每标签一份：切走再切回不会丢掉搜索框内容和结果）
+    /// 搜索框文本。
+    pub search_text: String,
+    /// 搜索框里的光标位置（字符下标）。
+    pub search_caret: usize,
+    /// 搜索进行到哪了（未在搜索时为 `None`）。
+    pub search_state: Option<SearchState>,
+    /// 搜索前的原始列表（退出搜索时恢复）。
+    pub search_backup: Option<Vec<Entry>>,
+    /// 目录还在加载时按了回车（或 `/searchkey` 启动）：等枚举落地后
+    /// 自动补一次搜索，而不是无声丢掉。见 `begin_search`。
+    pub pending_search: bool,
 }
 
 impl Tab {
@@ -286,7 +215,42 @@ impl Tab {
             loading: false,
             error: None,
             sort,
+            pending_select: None,
+            drive_info: Vec::new(),
+            search_text: String::new(),
+            search_caret: 0,
+            search_state: None,
+            search_backup: None,
+            pending_search: false,
         }
+    }
+}
+
+/// 把已查到的卷标/容量回填到「此电脑」的驱动器条目上。
+///
+/// 卷标查询和盘符列表是两条并行请求，谁先回来不一定：这个函数两边都会调，
+/// 已经填过的再填一次也不会出错。
+fn apply_drive_info(t: &mut Tab) {
+    if t.drive_info.is_empty() {
+        return;
+    }
+    let (infos, entries) = (&t.drive_info, &mut t.entries);
+    for info in infos {
+        let Some(e) = entries.iter_mut().find(|e| e.full == info.root) else {
+            continue;
+        };
+        let letter = info
+            .root
+            .to_string_lossy()
+            .trim_end_matches('\\')
+            .to_string();
+        // 卷标到了就把「C:」换成「本地磁盘 (C:)」/「数据 (D:)」
+        e.name = if info.label.is_empty() {
+            format!("本地磁盘 ({letter})")
+        } else {
+            format!("{} ({letter})", info.label)
+        };
+        e.volume = info.volume;
     }
 }
 
@@ -376,6 +340,17 @@ pub struct Application {
     /// 只在选中项变化时重建：解码一张照片要几毫秒，而重绘一帧就问一次。
     pub preview: Option<crate::ui::preview::Preview>,
 
+    // ---- 后台 IO ----
+    /// 后台工作线程：枚举、容量、预览、搜索、文件操作都从这里出去。
+    pub io: crate::io::Io,
+    /// 三类任务的请求号，只认最新的一个——过期结果直接丢，
+    /// 这样「连续切目录」「连续换选中项」不会被旧结果覆盖。
+    nav_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    preview_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    search_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// 正在等预览结果的文件：同一份不要反复投递。
+    preview_pending: Option<PathBuf>,
+
     /// 快捷项拖动时的落点 y（画插入指示线用）。
     pub nav_drop_y: Option<i32>,
     /// 各分组自上而下的顺序与屏幕范围（拖动分隔线换位时算落点用）。
@@ -405,6 +380,8 @@ pub struct Application {
 
     pub fonts: FontCache,
     pub icons: IconCache,
+    /// 图片缩略图（大/中图标视图用），按路径缓存解码好的句柄。
+    pub thumbs: crate::fs::thumbs::ThumbCache,
     pub back_buffer: BackBuffer,
 
     pub hover: ui::Hit,
@@ -415,6 +392,19 @@ pub struct Application {
     /// 鼠标离开跟踪是否已安装。
     tracking_mouse: bool,
 
+    /// IME（输入法）组合窗的锚点：当前编辑框里插入符的客户区坐标。
+    ///
+    /// 绘制插入符的那几处顺手更新；IME 激活时（见 `place_ime_window`）
+    /// 把它换算成屏幕坐标告诉输入法，候选词才会跟在光标旁边而不是
+    /// 飘在屏幕左上角。
+    pub ime_anchor: Option<(i32, i32)>,
+
+    /// 状态栏瞬态提示（如「已复制路径」），到点自动清（见 `TIMER_NOTE`）。
+    ///
+    /// 高频操作的结果不该用模态框打断——点一下复制路径还得再去点
+    /// 一下「我知道了」，两次点击换一次复制。
+    pub status_note: Option<String>,
+
     // 地址栏编辑态
     pub address_editing: bool,
     /// 地址栏文本里的选区 `(anchor, caret)`，两个都是字符下标。
@@ -423,16 +413,14 @@ pub struct Application {
     pub address_sel: Option<(usize, usize)>,
     pub address_text: String,
     pub address_caret: usize,
+    /// 地址栏历史下拉的候选（按当前输入前缀匹配，见 `cfg::history`）。
+    pub addr_suggest: Vec<String>,
+    /// 下拉里键盘高亮的那一条。
+    pub addr_suggest_sel: Option<usize>,
 
     // 搜索
+    /// 搜索框是否获得键盘焦点（焦点是全局的 UI 状态，不随标签保存）。
     pub search_focused: bool,
-    pub search_text: String,
-    pub search_caret: usize,
-    pub search_mode: SearchMode,
-    /// 搜索进行到哪了（未在搜索时为 `None`）。
-    pub search_state: Option<SearchState>,
-    /// 搜索前的原始列表（退出搜索时恢复）。
-    search_backup: Option<Vec<Entry>>,
 
     /// 合并待处理的导航目标。
     ///
@@ -504,6 +492,11 @@ impl Application {
             nav_drop_y: None,
             tooltip_ready: false,
             preview: None,
+            io: crate::io::Io::new(),
+            nav_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            preview_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            search_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            preview_pending: None,
             nav_groups: Vec::new(),
             nav_sep_drag: None,
             nav_scroll: 0,
@@ -516,6 +509,7 @@ impl Application {
             dialog: None,
             fonts: FontCache::new(scale),
             icons: IconCache::new(),
+            thumbs: crate::fs::thumbs::ThumbCache::default(),
             back_buffer: BackBuffer::new(),
             hover: ui::Hit::None,
             pressed: ui::Hit::None,
@@ -523,16 +517,15 @@ impl Application {
             mouse_y: -1,
             modifiers: Modifiers::default(),
             tracking_mouse: false,
+            ime_anchor: None,
+            status_note: None,
             address_editing: false,
             address_sel: None,
             address_text: String::new(),
             address_caret: 0,
+            addr_suggest: Vec::new(),
+            addr_suggest_sel: None,
             search_focused: false,
-            search_text: String::new(),
-            search_caret: 0,
-            search_mode: SearchMode::Quick,
-            search_state: None,
-            search_backup: None,
             pending_nav: None,
             rename_target: None,
             inline_edit_text: String::new(),
@@ -565,7 +558,8 @@ impl Application {
             // 于是从边框（那里是左右/上下缩放光标）滑进客户区后箭头回不来，
             // 整个窗口就一直显示缩放图标。
             let arrow = LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
-            let atom = wnd::register_class(CLASS_NAME, wnd_proc, std::ptr::null_mut(), arrow);
+            let atom =
+                winwnd::register_class(CLASS_NAME, wnd_proc, std::ptr::null_mut(), arrow);
             if atom == 0 {
                 // 类已注册（同进程二次创建）也继续
             }
@@ -601,12 +595,12 @@ impl Application {
             }
             self.hwnd = hwnd;
             // 外圈小圆角，内部保持方正
-            wnd::apply_round_corners(hwnd);
+            winwnd::apply_round_corners(hwnd);
             // 登记 OLE 放置目标：否则拖东西过来整块窗口都是禁止光标
             droptarget::register(hwnd);
 
             if centered {
-                let (cx, cy) = wnd::center_on_monitor(hwnd, w, h);
+                let (cx, cy) = winwnd::center_on_monitor(hwnd, w, h);
                 x = cx;
                 y = cy;
                 SetWindowPos(
@@ -622,6 +616,10 @@ impl Application {
 
             crate::fs::icons::apply_window_icons(hwnd);
             DragAcceptFiles(hwnd, 1);
+
+            // 后台 IO 在这里绑定句柄：此后后台干完活就能 PostMessage 唤醒我们。
+            // 必须早于 open_initial_tabs——初始标签的目录枚举就走后台。
+            self.io.bind(hwnd);
 
             // 管道服务端（失败不影响启动）
             self.pipe = PipeServer::create();
@@ -641,7 +639,7 @@ impl Application {
             self.open_initial_tabs();
 
             // ---- 消息循环 ----
-            let code = wnd::message_loop();
+            let code = winwnd::message_loop();
             crate::win::init::shutdown_process();
             let _ = code;
         }
@@ -691,7 +689,7 @@ impl Application {
         // 2) `/searchkey` 直接进入搜索（原软件行为）
         if let Some(k) = self.cl.search_key.clone() {
             self.new_tab(Some(user_home()));
-            self.search_text = k;
+            self.cur_mut().search_text = k;
             // 启动参数本来就等于用户已经按过一次回车，直接搜
             self.begin_search();
             return;
@@ -767,14 +765,6 @@ impl Application {
         let px = self.font_px(draw::font::UI);
         self.fonts.get(px, false)
     }
-    pub fn font_ui_bold(&mut self) -> HFONT {
-        let px = self.font_px(draw::font::UI_BOLD);
-        self.fonts.get(px, true)
-    }
-    pub fn font_title(&mut self) -> HFONT {
-        let px = self.font_px(draw::font::TITLE);
-        self.fonts.get(px, true)
-    }
     pub fn font_small(&mut self) -> HFONT {
         let px = self.font_px(draw::font::SMALL);
         self.fonts.get(px, false)
@@ -807,6 +797,17 @@ impl Application {
         let i = self.active_tab;
         self.tabs.get_mut(i)
     }
+
+    /// 当前标签（`tabs` 永不为空：关掉最后一个标签走的是关窗）。
+    fn cur(&self) -> &Tab {
+        &self.tabs[self.active_tab]
+    }
+
+    fn cur_mut(&mut self) -> &mut Tab {
+        let i = self.active_tab;
+        &mut self.tabs[i]
+    }
+
 
     pub fn can_go_back(&self) -> bool {
         self.active().map(|t| t.history_pos > 0).unwrap_or(false)
@@ -973,10 +974,8 @@ impl Application {
             }
             crate::ui::navpane::NavKind::Tag { index, .. } => {
                 let index = *index;
-                if let Some(tag) = self.cfg.tags.list.get_mut(index) {
-                    tag.expanded = !tag.expanded;
-                    save_tags = true;
-                }
+                self.cfg.tags.toggle_expanded(index);
+                save_tags = true;
             }
             _ => return,
         }
@@ -1022,6 +1021,8 @@ impl Application {
             t.scroll_y = 0;
             t.error = None;
             t.loading = true;
+            // 换了目录就不是原来那个搜索意图了，挂起的搜索别跟过来
+            t.pending_search = false;
         }
 
         // 记录地址历史（原软件的 addr_history.ini）
@@ -1070,38 +1071,235 @@ impl Application {
         };
 
         let is_computer = self.tabs[idx].is_computer;
-        let path = self.tabs[idx].path.clone();
-
-        // 枚举是同步的：目录通常在毫秒级完成；超大目录由 Shell 的
-        // FIND_FIRST_EX_LARGE_FETCH 加速。异步化留作后续优化点。
         let is_recycle = self.tabs[idx].is_recycle;
-        let (entries, error) = if is_recycle {
-            (crate::fs::recycle::list(), None)
+        let path = self.tabs[idx].path.clone();
+        let kind = if is_recycle {
+            ListKind::Recycle
         } else if is_computer {
-            (enumerate::list_computer(&opts).entries, None)
+            ListKind::Computer
         } else {
-            match enumerate::list_dir(&path, &opts) {
-                Ok(listing) => (listing.entries, None),
-                Err(e) => (Vec::new(), Some(e)),
-            }
+            ListKind::Dir
         };
 
-        let t = &mut self.tabs[idx];
-        t.entries = entries;
-        t.error = error;
-        t.loading = false;
-        t.selected.clear();
-        t.anchor = None;
-        t.scroll_y = 0;
-        self.search_backup = None;
-        // 换了目录，上一次搜索的状态和结果都不再成立
-        self.search_state = None;
-        self.search_text.clear();
-        self.search_caret = 0;
+        // 枚举一律丢给后台：大目录、慢盘、离线网络位置都可能让 list_dir
+        // 卡上好几秒，放在消息循环里就是整个窗口假死。这里只负责把标签
+        // 置成「加载中」并发出请求，结果回来时再填（见 `on_io`）。
+        {
+            let t = &mut self.tabs[idx];
+            t.entries.clear();
+            t.selected.clear();
+            t.anchor = None;
+            t.scroll_y = 0;
+            t.error = None;
+            t.loading = true;
+            // 换了目录，这个标签上一次搜索的状态和结果都不再成立
+            t.search_backup = None;
+            t.search_state = None;
+            t.pending_search = false;
+            t.search_text.clear();
+            t.search_caret = 0;
+        }
+
+        let id = self.nav_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.io.send(Job::List {
+            id,
+            tab: idx,
+            path: path.clone(),
+            opts,
+            kind,
+        });
+
+        // 「此电脑」的卷标与容量单独再发一个请求：那两个系统调用在离线
+        // 网络盘上会卡几十秒，必须和「先把盘符列出来」分开做。
+        if kind == ListKind::Computer {
+            self.io.send(Job::Volumes {
+                id,
+                tab: idx,
+                drives: crate::fs::drives(),
+            });
+        }
 
         // 标题跟着活动标签走。放在这里而不是只在 load_into_active 里：
         // 新建标签、刷新、切标签都走本函数，漏一处标题就会停在软件名上。
         self.sync_window_title();
+        self.request_repaint();
+    }
+
+    /// 应用一条后台结果。过期的（请求号不是最新的）直接丢。
+    fn on_io(&mut self, done: crate::io::Done) {
+        match done {
+            crate::io::Done::Listed {
+                id,
+                tab,
+                path,
+                kind,
+                entries,
+                error,
+            } => {
+                if id != self.nav_seq.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Some(t) = self.tabs.get_mut(tab) else {
+                    return;
+                };
+                // 标签可能已经换了目录（或用同一标签又发了一次请求）
+                if t.path != path {
+                    return;
+                }
+                t.entries = entries;
+                t.error = error;
+                t.loading = false;
+                let _ = kind;
+                // 卷标可能比列表先回来，这里补一次回填
+                apply_drive_info(t);
+                // 之前记下的「加载完成后要选中的名字」（地址栏输入文件路径、
+                // 新建文件夹、重命名）在这里落地
+                if let Some(name) = t.pending_select.take() {
+                    if let Some(i) = t.entries.iter().position(|e| e.name == name) {
+                        t.selected.clear();
+                        t.selected.insert(i);
+                        t.anchor = Some(i);
+                    }
+                }
+                // 图标键/类型名在数据落地时补齐，绘制路径上只读
+                self.fill_entry_meta(tab);
+                // 加载中按过回车（或 /searchkey 启动）的搜索，现在有可
+                // 备份的原始列表了，补上那次没发出去的搜索
+                if self.tabs[tab].pending_search && tab == self.active_tab {
+                    self.tabs[tab].pending_search = false;
+                    self.begin_search();
+                }
+            }
+            crate::io::Done::Volumes { id, tab, infos } => {
+                if id != self.nav_seq.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Some(t) = self.tabs.get_mut(tab) else {
+                    return;
+                };
+                t.drive_info = infos;
+                apply_drive_info(t);
+            }
+            crate::io::Done::Previewed { id, path, data } => {
+                if id != self.preview_seq.load(Ordering::SeqCst) {
+                    return;
+                }
+                if self.preview_pending.as_deref() != Some(path.as_path()) {
+                    return;
+                }
+                self.preview_pending = None;
+                // GDI+ 解码只能在这里做（UI 线程）
+                self.preview = Some(crate::ui::preview::Preview::from_data(path, data));
+            }
+            crate::io::Done::Thumbed { path, icon } => {
+                // 缓存超限被清出来的旧句柄在这里销毁
+                let stale = self.thumbs.store(path, icon);
+                crate::fs::thumbs::ThumbCache::destroy(&stale);
+                self.request_repaint();
+            }
+            crate::io::Done::Searched { id, tab, key, hits } => {
+                if id != self.search_seq.load(Ordering::SeqCst) {
+                    return;
+                }
+                // 结果落到「发起搜索的那个标签」上，而不是当前标签：搜索
+                // 跑在后台，期间用户完全可以切到别的标签去。以前这里一旦
+                // 切走就整条结果丢弃，那个标签会永远停在「正在搜索…」。
+                let Some(t) = self.tabs.get_mut(tab) else {
+                    return;
+                };
+                // 该标签的搜索词必须没变过（用户可能改了词或退出了搜索）
+                if key != t.search_text.trim().to_lowercase() {
+                    return;
+                }
+                let mut hits = hits;
+                // 第三级兜底：「此电脑」「回收站」这类虚拟视图没有真实目录，
+                // 索引和子树扫描都无从下手，只好在已加载条目里按名字过一遍。
+                if hits.is_empty() {
+                    if let Some(backup) = t.search_backup.as_ref() {
+                        hits = backup
+                            .iter()
+                            .filter(|e| e.name.to_lowercase().contains(&key))
+                            .cloned()
+                            .collect();
+                    }
+                }
+                let found = hits.len();
+                t.entries = hits;
+                t.selected.clear();
+                t.anchor = None;
+                t.scroll_y = 0;
+                t.search_state = Some(SearchState::Done { hits: found });
+                self.fill_entry_meta(tab);
+                // 没有别的标签还在搜了，超时定时器就没必要再挂着
+                if !self
+                    .tabs
+                    .iter()
+                    .any(|t| matches!(t.search_state, Some(SearchState::Running)))
+                {
+                    self.kill_search_timeout();
+                }
+            }
+            crate::io::Done::OpDone { result } => {
+                if result == fsops::OpResult::Ok {
+                    // 剪切粘贴（移动）成功后剪贴板语义才失效
+                    self.cut_pending = false;
+                    self.refresh_active_tab();
+                } else if let fsops::OpResult::Failed(msg) = result {
+                    self.show_message(&msg);
+                    // 失败也要刷新：批量操作用户可能选了「跳过」，前面几项已经改了
+                    self.refresh_active_tab();
+                }
+            }
+        }
+        self.request_repaint();
+    }
+
+    /// 取干所有已就绪的后台结果。由 `WM_APP_IO` 调用。
+    pub fn drain_io(&mut self) {
+        let mut guard = 0;
+        while let Some(done) = self.io.try_recv() {
+            self.on_io(done);
+            // 一次涌入几百条时也不要长时间霸占消息循环
+            guard += 1;
+            if guard >= 64 {
+                unsafe {
+                    PostMessageW(self.hwnd, crate::io::WM_APP_IO, 0, 0);
+                }
+                break;
+            }
+        }
+    }
+
+    /// 条目落地后一次性补齐图标键与类型名。
+    ///
+    /// 这两样以前留在绘制路径上现算：每帧、每行都要重新切一次扩展名、
+    /// 查一次类型名（还要分配一个 String），而 `Entry.icon_key` /
+    /// `Entry.type_name` 这两个本就是缓存的字段从来没被写回过。
+    /// 现在改在数据进入 UI 状态的那一刻收尾，一屏 30 行只算一次。
+    fn fill_entry_meta(&mut self, tab: usize) {
+        // 结构体解构拿到两个互不重叠的可变借用
+        let Application { icons, tabs, .. } = self;
+        let Some(t) = tabs.get_mut(tab) else {
+            return;
+        };
+        for e in &mut t.entries {
+            if e.icon_key == crate::fs::entry::IconKey::Pending {
+                e.icon_key = crate::fs::icons::key_for_entry(
+                    &e.name,
+                    &e.full,
+                    e.is_dir(),
+                    e.kind == EntryKind::Drive,
+                );
+            }
+            if e.type_name.is_empty() {
+                e.type_name = if e.is_dir() {
+                    icons.dir_type_name()
+                } else {
+                    let ext = e.ext();
+                    icons.type_name(&ext)
+                };
+            }
+        }
     }
 
     // ------------------------------------------------------------ 标签
@@ -1132,9 +1330,8 @@ impl Application {
             self.request_close();
             return;
         }
-        if index == self.active_tab {
-            self.end_search_on_tab_switch();
-        }
+        // 下标会整体前移，任何在途搜索的结果都可能落到别的标签上
+        self.cancel_pending_search();
         self.tabs.remove(index);
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len().saturating_sub(1);
@@ -1146,32 +1343,24 @@ impl Application {
 
     pub fn set_active_tab(&mut self, index: usize) {
         if index < self.tabs.len() {
-            if index != self.active_tab {
-                self.end_search_on_tab_switch();
-            }
+            // 搜索状态是每标签一份的，切过去直接用它自己那份：
+            // 谁在搜索、搜了什么、结果几条，都跟着标签走。
             self.active_tab = index;
             self.sync_window_title();
+            // 挂起的搜索若是在后台标签上加载完成的，切回来时补触发
+            if self.tabs[index].pending_search && !self.tabs[index].loading {
+                self.tabs[index].pending_search = false;
+                self.begin_search();
+            }
             self.request_repaint();
         }
     }
 
-    /// 离开当前标签前收起搜索。
-    ///
-    /// 搜索状态和「搜索前的列表」都只有一份、属于当前标签：留着它们，
-    /// 新标签的状态栏就会报上一个标签的匹配数。恢复列表要趁还没换
-    /// `active_tab`，否则会写进新标签里。
-    fn end_search_on_tab_switch(&mut self) {
-        self.restore_search_backup();
-        self.search_state = None;
-        self.search_text.clear();
-        self.search_caret = 0;
-    }
-
+    /// 关掉标签前把在途的搜索作废。
     pub fn next_tab(&mut self, delta: i32) {
         if self.tabs.len() < 2 {
             return;
         }
-        self.end_search_on_tab_switch();
         let n = self.tabs.len() as i32;
         let cur = self.active_tab as i32;
         let next = ((cur + delta) % n + n) % n;
@@ -1298,6 +1487,9 @@ impl Application {
     /// 实现策略：小于 1 MiB 的文本类文件在状态栏滚动显示前若干行；
     /// 图片交给系统照片查看器。这里保持轻量，不引入图像解码依赖。
     pub fn quick_preview_selection(&mut self) {
+        if !self.cfg.settings.enable_quickpreview {
+            return;
+        }
         let Some(&i) = self.active().and_then(|t| t.selected.iter().next()) else {
             return;
         };
@@ -1391,248 +1583,6 @@ impl Application {
         }
     }
 
-    // ------------------------------------------------------------ 文件操作
-
-    fn selected_paths(&self) -> Vec<PathBuf> {
-        let Some(t) = self.active() else {
-            return Vec::new();
-        };
-        let mut v: Vec<usize> = t.selected.iter().copied().collect();
-        v.sort_unstable();
-        v.into_iter()
-            .filter_map(|i| t.entries.get(i).map(|e| e.full.clone()))
-            .collect()
-    }
-
-    /// 点击详细信息表头第 `col` 列：切换成按这一列排序。
-    ///
-    /// 规则和资源管理器一致——点同一列翻转升降序，点新的一列从升序开始。
-    pub fn sort_by_column(&mut self, col: usize) {
-        use crate::fs::enumerate::SortKey;
-        let key = match col {
-            0 => SortKey::Name,
-            1 => SortKey::Modified,
-            2 => SortKey::Kind,
-            _ => SortKey::Size,
-        };
-        let idx = self.active_tab;
-        if idx >= self.tabs.len() {
-            return;
-        }
-        let same = self.tabs[idx].sort.key == key;
-        self.tabs[idx].sort = crate::fs::enumerate::Sort {
-            key,
-            descending: if same { !self.tabs[idx].sort.descending } else { false },
-        };
-        self.cfg.settings.sort_key = key;
-        self.cfg.settings.sort_desc = self.tabs[idx].sort.descending;
-        self.reload_active_tab();
-        self.request_repaint();
-    }
-
-    pub fn delete_selection(&mut self, permanent: bool) {
-        let paths = self.selected_paths();
-        if paths.is_empty() {
-            return;
-        }
-        if self.in_recycle_bin() {
-            // 在回收站里再删一次＝彻底删除，连元数据一起清掉
-            let mut err = None;
-            for p in &paths {
-                if let Err(e) = crate::fs::recycle::purge(p) {
-                    err = Some(e);
-                }
-            }
-            if let Some(e) = err {
-                self.show_message(&e);
-            }
-            self.refresh_active_tab();
-            return;
-        }
-        let res = if permanent {
-            ops::delete_permanent(self.hwnd, &paths)
-        } else {
-            ops::delete_to_recycle(self.hwnd, &paths)
-        };
-        self.handle_op_result(res);
-    }
-
-    pub fn copy_selection(&mut self) {
-        let paths = self.selected_paths();
-        if paths.is_empty() {
-            return;
-        }
-        if !shell::set_clipboard_files(&paths) {
-            self.show_message("无法写入剪贴板");
-        }
-    }
-
-    pub fn cut_selection(&mut self) {
-        // 剪切与复制共用剪贴板；粘贴时按同样方式移动。
-        // 为区分语义，把「剪切」状态记在应用内。
-        let paths = self.selected_paths();
-        if paths.is_empty() {
-            return;
-        }
-        if shell::set_clipboard_files(&paths) {
-            self.cut_pending = true;
-        } else {
-            self.show_message("无法写入剪贴板");
-        }
-    }
-
-    pub fn paste_into_active_tab(&mut self) {
-        let sources = shell::get_clipboard_files();
-        if sources.is_empty() {
-            return;
-        }
-        let Some(target) = self.active().map(|t| t.path.clone()) else {
-            return;
-        };
-        if target.as_os_str().is_empty() {
-            return;
-        }
-
-        let res = if self.cut_pending {
-            ops::move_to(self.hwnd, &sources, &target)
-        } else {
-            ops::copy_to(self.hwnd, &sources, &target)
-        };
-        if self.cut_pending && res == ops::OpResult::Ok {
-            self.cut_pending = false;
-        }
-        self.handle_op_result(res);
-    }
-
-    pub fn begin_rename_selection(&mut self) {
-        let Some(&i) = self.active().and_then(|t| t.selected.iter().next()) else {
-            return;
-        };
-        let Some(name) = self.active().and_then(|t| t.entries.get(i)).map(|e| e.name.clone())
-        else {
-            return;
-        };
-        // 进入内联重命名：复用地址栏的编辑机制，锚定到该项
-        self.rename_target = Some(i);
-        self.address_editing = false;
-        self.search_focused = false;
-        self.inline_edit_text = name.clone();
-        self.inline_edit_caret = name.chars().count();
-        self.request_repaint();
-    }
-
-    fn handle_op_result(&mut self, res: ops::OpResult) {
-        match res {
-            ops::OpResult::Ok => self.refresh_active_tab(),
-            ops::OpResult::Cancelled => {}
-            ops::OpResult::Failed(msg) => {
-                self.show_message(&msg);
-                self.refresh_active_tab();
-            }
-        }
-    }
-
-    pub fn toolbar_action(&mut self, index: usize) {
-        match index {
-            0 => {
-                // 新建文件
-                if let Some(dir) = self.active().map(|t| t.path.clone()) {
-                    match ops::create_file(&dir, "新建文本文档", "txt") {
-                        Ok(p) => {
-                            self.refresh_active_tab();
-                            self.select_by_path(&p);
-                        }
-                        Err(e) => self.show_message(&e),
-                    }
-                }
-            }
-            1 => {
-                // 新建文件夹
-                if let Some(dir) = self.active().map(|t| t.path.clone()) {
-                    match ops::create_folder(&dir) {
-                        Ok(p) => {
-                            self.refresh_active_tab();
-                            self.select_by_path(&p);
-                        }
-                        Err(e) => self.show_message(&e),
-                    }
-                }
-            }
-            2 => self.cut_selection(),
-            3 => self.copy_selection(),
-            4 => self.paste_into_active_tab(),
-            5 => self.delete_selection(false),
-            6 => self.begin_rename_selection(),
-            7 => self.cycle_view_mode(),
-            8 => {
-                self.search_focused = true;
-                self.request_repaint();
-            }
-            9 => {
-                // 快速访问：回到此电脑
-                self.navigate_to(PathBuf::new());
-            }
-            _ => {}
-        }
-    }
-
-    fn select_by_path(&mut self, path: &std::path::Path) {
-        let Some(idx) = self
-            .active()
-            .and_then(|t| t.entries.iter().position(|e| e.full == path))
-        else {
-            return;
-        };
-        self.select_entry(idx, false, false);
-        interact::scroll_into_view(self, idx);
-    }
-
-    pub fn cycle_view_mode(&mut self) {
-        let Some(t) = self.active_mut() else { return };
-        let all = ViewMode::ALL;
-        let pos = all.iter().position(|&v| v == t.view_mode).unwrap_or(0);
-        t.view_mode = all[(pos + 1) % all.len()];
-        t.scroll_y = 0;
-        self.request_repaint();
-    }
-
-    /// Ctrl+滚轮：在视图档之间升降。
-    ///
-    /// 档位顺序从「最大信息量」到「最大图标」：详细信息排第一个，
-    /// 往上是它、往下依次是大图标→中→小图标。`dir > 0` 表示向上滚（更详细）。
-    pub fn zoom_view(&mut self, dir: i32) {
-        const STEPS: [ViewMode; 5] = [
-            ViewMode::Detail,
-            ViewMode::LargeEx,
-            ViewMode::Large,
-            ViewMode::Medium,
-            ViewMode::Small,
-        ];
-        let Some(t) = self.active_mut() else { return };
-        let cur = STEPS.iter().position(|&v| v == t.view_mode).unwrap_or(2);
-        // 数组是从大到小排的，所以放大 = 索引减
-        let next = if dir > 0 {
-            cur.saturating_sub(1)
-        } else {
-            (cur + 1).min(STEPS.len() - 1)
-        };
-        if next == cur {
-            return;
-        }
-        t.view_mode = STEPS[next];
-        t.scroll_y = 0;
-        self.cfg.settings.view_mode = STEPS[next];
-        self.request_repaint();
-    }
-
-    pub fn set_view_mode(&mut self, mode: ViewMode) {
-        if let Some(t) = self.active_mut() {
-            t.view_mode = mode;
-            t.scroll_y = 0;
-        }
-        self.cfg.settings.view_mode = mode;
-        self.request_repaint();
-    }
 
     // ------------------------------------------------------------ 收藏栏
     /// 键盘快速定位（资源管理器同款）。
@@ -1798,28 +1748,6 @@ impl Application {
         }
     }
 
-    /// 打开任意路径：目录就进标签，文件交给默认关联。
-    ///
-    /// `new_tab` 只对目录有意义——文件本来就是在外部程序里打开的。
-    /// 标签条目（`cfg.tags`）既可能是目录也可能是文件，导航窗格与详情窗格
-    /// 点击时都走这里，省得每处各写一遍「是目录还是文件」的判断。
-    pub fn open_any_path(&mut self, path: PathBuf, new_tab: bool) {
-        if path.is_dir() {
-            self.open_dir(path, new_tab);
-        } else if let Err(e) = shell::open_default(self.hwnd, &path) {
-            self.show_message(&e);
-        }
-    }
-
-    pub fn add_current_to_bookmarks(&mut self) {
-        let path = match self.active() {
-            Some(t) if !t.is_computer => t.path.clone(),
-            _ => return,
-        };
-        self.cfg.bookmarks.add_or_update(path, None);
-        self.request_repaint();
-    }
-
     /// 把一批路径加进收藏夹（拖到收藏栏松手时调用）。
     pub fn add_paths_to_bookmarks(&mut self, paths: &[PathBuf]) {
         if paths.is_empty() {
@@ -1939,7 +1867,102 @@ impl Application {
         self.address_editing = true;
         self.search_focused = false;
         self.ensure_caret_timer();
+        // 一进编辑态就把历史候选挂出来：这是「最近去过哪」最自然的入口，
+        // 不用先敲几个字母才看得见。
+        self.refresh_addr_suggest();
         self.request_repaint();
+    }
+
+    /// 地址栏历史下拉是否该显示。
+    pub fn addr_suggest_open(&self) -> bool {
+        self.address_editing && !self.addr_suggest.is_empty()
+    }
+
+    /// 按当前输入刷新历史候选。
+    ///
+    /// 键入、退格、粘贴、进入编辑态都走 `after_edit` / 这里，别在绘制里做：
+    /// 每帧重新查一遍历史就是纯浪费。已经和历史项完全相同的就不列出来，
+    /// 否则下拉里会出现一条「和输入框里一模一样的路径」。
+    pub fn refresh_addr_suggest(&mut self) {
+        if !self.address_editing {
+            self.addr_suggest.clear();
+            self.addr_suggest_sel = None;
+            return;
+        }
+        let cur = self.address_text.trim().to_string();
+        let items: Vec<String> = self
+            .cfg
+            .history
+            .suggest(&cur, ADDR_SUGGEST_MAX)
+            .into_iter()
+            .filter(|s| !s.eq_ignore_ascii_case(&cur))
+            .map(str::to_string)
+            .collect();
+        self.addr_suggest = items;
+        self.addr_suggest_sel = None;
+    }
+
+    pub fn close_addr_suggest(&mut self) {
+        self.addr_suggest.clear();
+        self.addr_suggest_sel = None;
+    }
+
+    /// 历史下拉一行的高度（跟随 DPI 缩放）。
+    fn addr_suggest_row_h(&self) -> i32 {
+        (26.0 * self.layout.scale).round() as i32
+    }
+
+    /// 历史下拉的整块浮层矩形（贴在地址栏下沿）。
+    pub fn addr_suggest_pane_rect(&self) -> RECT {
+        let a = self.layout.address;
+        let h = self.addr_suggest_row_h() * self.addr_suggest.len() as i32;
+        let top = a.bottom + (4.0 * self.layout.scale).round() as i32;
+        RECT {
+            left: a.left,
+            top,
+            right: a.right,
+            bottom: top + h,
+        }
+    }
+
+    /// 历史下拉第 `i` 条的矩形。绘制与命中测试共用同一份几何。
+    pub fn addr_suggest_item_rect(&self, i: usize) -> RECT {
+        let p = self.addr_suggest_pane_rect();
+        let rh = self.addr_suggest_row_h();
+        RECT {
+            left: p.left + 2,
+            top: p.top + i as i32 * rh,
+            right: p.right - 2,
+            bottom: p.top + (i as i32 + 1) * rh,
+        }
+    }
+
+    /// 上下键在下拉里移动高亮。返回 `true` 表示这次按键被下拉吃掉了。
+    pub fn addr_suggest_move(&mut self, down: bool) -> bool {
+        if !self.addr_suggest_open() {
+            return false;
+        }
+        let n = self.addr_suggest.len();
+        let next = match (self.addr_suggest_sel, down) {
+            (None, true) => 0,
+            (None, false) => n - 1,
+            (Some(i), true) => (i + 1) % n,
+            (Some(i), false) => (i + n - 1) % n,
+        };
+        self.addr_suggest_sel = Some(next);
+        self.request_repaint();
+        true
+    }
+
+    /// 采纳下拉里的第 `i` 条：直接跳过去。
+    pub fn accept_addr_suggest(&mut self, i: usize) {
+        let Some(p) = self.addr_suggest.get(i).cloned() else {
+            return;
+        };
+        self.close_addr_suggest();
+        self.address_editing = false;
+        self.address_sel = None;
+        self.navigate_to(PathBuf::from(p));
     }
 
     pub fn focus_search(&mut self) {
@@ -1966,24 +1989,39 @@ impl Application {
     /// 确保详情窗格的预览对应当前选中项。
     ///
     /// 由绘制路径在每帧开头调用：传进来的路径没变就什么都不做（命中缓存），
-    /// 变了才重新解码/读取。之所以放在绘制里而不是选中逻辑里，
+    /// 变了才投递一次后台读取。之所以放在绘制里而不是选中逻辑里，
     /// 是因为选中会从十几个地方改（点击、框选、键盘、刷新、拖放），
     /// 漏掉一处就会出现「选中换了但预览还是上一张」。
+    ///
+    /// 读盘、判尺寸、解文本都在后台（`io::Job::Preview`）；真正的 GDI+
+    /// 解码仍在 UI 线程，回到这里由 `on_io` 落地。以前整个流程都在这条
+    /// 绘制路径上同步跑，选中一张网络盘上的大图就会把窗口卡住。
     pub fn ensure_preview(&mut self, path: Option<PathBuf>, ext: &str, size: u64) {
-        match path {
-            None => self.preview = None,
-            Some(p) => {
-                if self
-                    .preview
-                    .as_ref()
-                    .map(|pr| pr.path == p)
-                    .unwrap_or(false)
-                {
-                    return;
-                }
-                self.preview = Some(crate::ui::preview::build(&p, ext, size));
-            }
+        let Some(p) = path else {
+            self.preview = None;
+            self.preview_pending = None;
+            return;
+        };
+        // 已经显示着这一份，或已经有一份在等结果
+        if self
+            .preview
+            .as_ref()
+            .map(|pr| pr.path == p)
+            .unwrap_or(false)
+        {
+            return;
         }
+        if self.preview_pending.as_deref() == Some(p.as_path()) {
+            return;
+        }
+        let id = self.preview_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.preview_pending = Some(p.clone());
+        self.io.send(Job::Preview {
+            id,
+            path: p,
+            ext: ext.to_string(),
+            size,
+        });
     }
 
     /// 悬停提示的节流：停在一个工具栏按钮上满 [`HOVER_TIP_MS`] 才出气泡。
@@ -2012,13 +2050,14 @@ impl Application {
         }
         self.address_editing = false;
         self.address_sel = None;
+        self.close_addr_suggest();
         self.search_focused = false;
-        if self.search_backup.is_some() && self.search_text.is_empty() {
+        if self.cur().search_backup.is_some() && self.cur().search_text.is_empty() {
             self.restore_search_backup();
         }
         // 失焦后「按回车搜索」就没人执行了：留着这句提示只会误导
-        if matches!(self.search_state, Some(SearchState::Pending)) {
-            self.search_state = None;
+        if matches!(self.cur().search_state, Some(SearchState::Pending)) {
+            self.cur_mut().search_state = None;
         }
         self.request_repaint();
     }
@@ -2031,14 +2070,25 @@ impl Application {
                 if new_name.trim().is_empty() {
                     self.show_message(S::ALERT_EMPTY_NAME);
                 } else {
-                    let res = ops::rename(self.hwnd, &p, &new_name);
-                    self.handle_op_result(res);
+                    let res = fsops::rename(self.hwnd, &p, &new_name);
+                    if res == fsops::OpResult::Ok {
+                        // 名字就是我们给的那个：本地就地更新，不整目录重扫
+                        self.apply_rename_locally(idx, &new_name);
+                    } else {
+                        self.handle_op_result(res);
+                    }
                 }
             }
             return;
         }
 
         if self.address_editing {
+            // 回车时优先采纳下拉里高亮的那一条，没有高亮才按输入框内容跳转
+            if let Some(i) = self.addr_suggest_sel {
+                self.accept_addr_suggest(i);
+                return;
+            }
+            self.close_addr_suggest();
             let text = self.address_text.clone();
             self.address_editing = false;
             self.address_sel = None;
@@ -2079,448 +2129,6 @@ impl Application {
         self.request_repaint();
     }
 
-    /// 按回车（或搜索框失焦）时触发搜索。
-    ///
-    /// 先把「正在搜索…」这一帧真正刷到屏幕上再开始干活：搜索是同步的，
-    /// 递归扫描最长要 400 ms，而 `request_repaint` 只是 `InvalidateRect`，
-    /// 不主动 `UpdateWindow` 的话这一帧会一直排在消息队列里，等搜索结束才
-    /// 画得出来——那时显示的已经是结果，用户根本看不到「正在搜索」。
-    pub fn begin_search(&mut self) {
-        if self.search_text.trim().is_empty() {
-            self.restore_search_backup();
-            return;
-        }
-        self.search_state = Some(SearchState::Running);
-        self.request_repaint();
-        if hwnd_valid(self.hwnd) {
-            unsafe {
-                UpdateWindow(self.hwnd);
-            }
-        }
-        self.run_search();
-        self.request_repaint();
-    }
-
-    /// 执行搜索。
-    ///
-    /// 命中来源按优先级回退：
-    ///   1. Windows 搜索索引（`SystemIndex`，与资源管理器搜索框同源）；
-    ///   2. 索引不可用 / 目录未被索引 → 当前目录子树递归扫描；
-    ///   3. 仍未命中 → 当前已加载条目里的名称包含匹配。
-    ///
-    /// 这样在关闭了索引服务的机器上依然有资源管理器同等的行为。
-    fn run_search(&mut self) {
-        /// 结果上限。搜索是「找得到就行」，不做全量列举。
-        const SEARCH_LIMIT: usize = 500;
-        /// 递归降级的时间预算，超时就用已扫到的部分。
-        const SCAN_BUDGET_MS: u32 = 400;
-
-        let key = self.search_text.trim().to_lowercase();
-        let idx = self.active_tab;
-        if idx >= self.tabs.len() {
-            self.search_state = None;
-            return;
-        }
-
-        if key.is_empty() {
-            self.restore_search_backup();
-            return;
-        }
-
-        if self.search_backup.is_none() {
-            self.search_backup = Some(self.tabs[idx].entries.clone());
-        }
-
-        let current = self.tabs[idx].path.clone();
-
-        // 1) 系统索引
-        let mut hits: Vec<Entry> = Vec::new();
-        if let Some(scope) = current.to_str() {
-            if let Ok(found) = crate::win::search::search_index(scope, &key, SEARCH_LIMIT) {
-                for h in found {
-                    if let Some(e) = crate::fs::enumerate::entry_from_path(std::path::Path::new(&h.path))
-                    {
-                        hits.push(e);
-                    }
-                }
-            }
-        }
-
-        // 2) 子树递归
-        if hits.is_empty() {
-            hits = crate::fs::enumerate::scan_subtree(
-                &current,
-                &key,
-                SEARCH_LIMIT,
-                SCAN_BUDGET_MS,
-            );
-        }
-
-        // 3) 已加载条目兜底（「此电脑」等虚拟视图没有真实目录可扫）
-        if hits.is_empty() {
-            if let Some(backup) = self.search_backup.as_ref() {
-                hits = backup
-                    .iter()
-                    .filter(|e| e.name.to_lowercase().contains(&key))
-                    .cloned()
-                    .collect();
-            }
-        }
-
-        let found = hits.len();
-        let t = &mut self.tabs[idx];
-        t.entries = hits;
-        t.selected.clear();
-        t.anchor = None;
-        t.scroll_y = 0;
-        self.search_state = Some(SearchState::Done { hits: found });
-        self.request_repaint();
-    }
-
-    fn restore_search_backup(&mut self) {
-        self.search_state = None;
-        if let Some(backup) = self.search_backup.take() {
-            let idx = self.active_tab;
-            if idx < self.tabs.len() {
-                self.tabs[idx].entries = backup;
-                self.tabs[idx].selected.clear();
-                self.tabs[idx].scroll_y = 0;
-            }
-        }
-        self.request_repaint();
-    }
-
-    // ------------------------------------------------- 编辑框（地址/搜索/重命名共用）
-
-    /// 当前正在编辑的文本缓冲（只读）。
-    fn edit_buffer(&self) -> Option<&String> {
-        if self.rename_target.is_some() {
-            Some(&self.inline_edit_text)
-        } else if self.address_editing {
-            Some(&self.address_text)
-        } else if self.search_focused {
-            Some(&self.search_text)
-        } else {
-            None
-        }
-    }
-
-    /// 当前正在编辑的文本缓冲（可写）。
-    fn edit_buffer_mut(&mut self) -> Option<&mut String> {
-        if self.rename_target.is_some() {
-            Some(&mut self.inline_edit_text)
-        } else if self.address_editing {
-            Some(&mut self.address_text)
-        } else if self.search_focused {
-            Some(&mut self.search_text)
-        } else {
-            None
-        }
-    }
-
-    fn edit_buffer_len(&self) -> usize {
-        self.edit_buffer().map(|b| b.chars().count()).unwrap_or(0)
-    }
-
-    /// 光标位置（可写）。
-    ///
-    /// 注意：不能与 `edit_buffer_mut` 的返回值同时存活——两者都借 `&mut self`。
-    fn caret_mut(&mut self) -> &mut usize {
-        if self.rename_target.is_some() {
-            &mut self.inline_edit_caret
-        } else if self.address_editing {
-            &mut self.address_caret
-        } else {
-            &mut self.search_caret
-        }
-    }
-
-    fn caret(&self) -> usize {
-        if self.rename_target.is_some() {
-            self.inline_edit_caret
-        } else if self.address_editing {
-            self.address_caret
-        } else {
-            self.search_caret
-        }
-    }
-
-    /// 编辑结束后统一收尾。
-    ///
-    /// 搜索框不再逐字符搜：一次搜索要跑系统索引加最多 400ms 的递归扫描，
-    /// 而且全在 UI 线程上同步执行，跟着每个按键跑一遍会让英文逐字母输入
-    /// 一顿一顿的。这里只把状态标成「等回车」，真正的搜索放到 Enter 或失焦时做。
-    fn after_edit(&mut self) {
-        if self.search_focused {
-            if self.search_text.trim().is_empty() {
-                self.restore_search_backup();
-            } else {
-                self.search_state = Some(SearchState::Pending);
-            }
-        }
-        self.request_repaint();
-    }
-
-    /// 当前选区（已归一化成 `(起, 止)`），没有选区返回 `None`。
-    fn selection(&self) -> Option<(usize, usize)> {
-        let (a, b) = self.address_sel?;
-        if a == b {
-            None
-        } else {
-            Some((a.min(b), a.max(b)))
-        }
-    }
-
-    /// 把选区删掉，返回删除后的光标位置；没有选区返回 `None`。
-    fn edit_delete_selection(&mut self) -> Option<usize> {
-        let (s0, s1) = self.selection()?;
-        let len = self.edit_buffer_len();
-        let s0 = s0.min(len);
-        let s1 = s1.min(len);
-        if let Some(buf) = self.edit_buffer_mut() {
-            let chars: Vec<char> = buf.chars().collect();
-            let mut out: String = chars[..s0].iter().collect();
-            out.extend(chars[s1..].iter());
-            *buf = out;
-        }
-        self.address_sel = None;
-        Some(s0)
-    }
-
-    pub fn edit_insert(&mut self, ch: char) {
-        if let Some(pos) = self.edit_delete_selection() {
-            *self.caret_mut() = pos;
-        }
-        let caret = self.caret();
-        let new_caret = match self.edit_buffer_mut() {
-            Some(buf) => {
-                let chars: Vec<char> = buf.chars().collect();
-                let pos = caret.min(chars.len());
-                let mut s: String = chars[..pos].iter().collect();
-                s.push(ch);
-                s.extend(chars[pos..].iter());
-                *buf = s;
-                pos + 1
-            }
-            None => caret,
-        };
-        *self.caret_mut() = new_caret;
-        self.address_sel = None;
-        self.after_edit();
-    }
-
-    pub fn edit_backspace(&mut self) {
-        if let Some(pos) = self.edit_delete_selection() {
-            *self.caret_mut() = pos;
-            self.after_edit();
-            return;
-        }
-        let caret = self.caret();
-        if caret == 0 {
-            return;
-        }
-        let new_caret = match self.edit_buffer_mut() {
-            Some(buf) => {
-                let chars: Vec<char> = buf.chars().collect();
-                let pos = caret.min(chars.len());
-                if pos == 0 {
-                    return;
-                }
-                let mut s: String = chars[..pos - 1].iter().collect();
-                s.extend(chars[pos..].iter());
-                *buf = s;
-                pos - 1
-            }
-            None => caret,
-        };
-        *self.caret_mut() = new_caret;
-        self.after_edit();
-    }
-
-    pub fn edit_delete(&mut self) {
-        if let Some(pos) = self.edit_delete_selection() {
-            *self.caret_mut() = pos;
-            self.after_edit();
-            return;
-        }
-        let caret = self.caret();
-        let changed = match self.edit_buffer_mut() {
-            Some(buf) => {
-                let chars: Vec<char> = buf.chars().collect();
-                let pos = caret.min(chars.len());
-                if pos >= chars.len() {
-                    false
-                } else {
-                    let mut s: String = chars[..pos].iter().collect();
-                    s.extend(chars[pos + 1..].iter());
-                    *buf = s;
-                    true
-                }
-            }
-            None => false,
-        };
-        if changed {
-            self.after_edit();
-        }
-    }
-
-    pub fn edit_move_caret(&mut self, delta: i32) {
-        let len = self.edit_buffer_len();
-        self.address_sel = None;
-        let c = self.caret_mut();
-        *c = (*c as i32 + delta).clamp(0, len as i32) as usize;
-        self.request_repaint();
-    }
-
-    pub fn edit_caret_home(&mut self) {
-        self.address_sel = None;
-        *self.caret_mut() = 0;
-        self.request_repaint();
-    }
-
-    pub fn edit_caret_end(&mut self) {
-        self.address_sel = None;
-        let len = self.edit_buffer_len();
-        *self.caret_mut() = len;
-        self.request_repaint();
-    }
-
-    /// 全选（Ctrl+A）。
-    pub fn edit_select_all(&mut self) {
-        let len = self.edit_buffer_len();
-        self.address_sel = Some((0, len));
-        *self.caret_mut() = len;
-        self.request_repaint();
-    }
-
-    /// 带 Shift 的光标移动：扩展现有选区。
-    pub fn edit_move_caret_shift(&mut self, delta: i32) {
-        let len = self.edit_buffer_len();
-        let caret = self.caret();
-        let anchor = self.address_sel.map(|(a, _)| a).unwrap_or(caret);
-        let next = (caret as i32 + delta).clamp(0, len as i32) as usize;
-        *self.caret_mut() = next;
-        self.address_sel = Some((anchor, next));
-        self.request_repaint();
-    }
-
-    /// 按词左右跳（Ctrl+← / Ctrl+→）。`extend` 为真时扩选。
-    pub fn edit_move_word(&mut self, dir: i32, extend: bool) {
-        let text = self.edit_buffer().cloned().unwrap_or_default();
-        let chars: Vec<char> = text.chars().collect();
-        let len = chars.len();
-        let caret = self.caret().min(len);
-        let anchor = self.address_sel.map(|(a, _)| a).unwrap_or(caret);
-        let mut i = caret as i32;
-        if dir < 0 {
-            // 先跳过左边空白，再跳过一整段非空白
-            while i > 0 && chars[(i - 1) as usize].is_whitespace() {
-                i -= 1;
-            }
-            while i > 0 && !chars[(i - 1) as usize].is_whitespace() {
-                i -= 1;
-            }
-        } else {
-            while (i as usize) < len && chars[i as usize].is_whitespace() {
-                i += 1;
-            }
-            while (i as usize) < len && !chars[i as usize].is_whitespace() {
-                i += 1;
-            }
-        }
-        let next = i.clamp(0, len as i32) as usize;
-        *self.caret_mut() = next;
-        self.address_sel = if extend { Some((anchor, next)) } else { None };
-        self.request_repaint();
-    }
-
-    /// 光标移到行首/行尾，`extend` 为真时扩选。
-    pub fn edit_caret_edge(&mut self, end: bool, extend: bool) {
-        let len = self.edit_buffer_len();
-        let caret = self.caret();
-        let anchor = self.address_sel.map(|(a, _)| a).unwrap_or(caret);
-        let next = if end { len } else { 0 };
-        *self.caret_mut() = next;
-        self.address_sel = if extend { Some((anchor, next)) } else { None };
-        self.request_repaint();
-    }
-
-    /// Ctrl+Backspace：删掉光标左边的一个词。
-    pub fn edit_backspace_word(&mut self) {
-        if let Some(pos) = self.edit_delete_selection() {
-            *self.caret_mut() = pos;
-            self.after_edit();
-            return;
-        }
-        let text = self.edit_buffer().cloned().unwrap_or_default();
-        let chars: Vec<char> = text.chars().collect();
-        let caret = self.caret().min(chars.len());
-        let mut i = caret;
-        while i > 0 && chars[i - 1].is_whitespace() {
-            i -= 1;
-        }
-        while i > 0 && !chars[i - 1].is_whitespace() {
-            i -= 1;
-        }
-        self.address_sel = Some((i, caret));
-        *self.caret_mut() = caret;
-        if let Some(pos) = self.edit_delete_selection() {
-            *self.caret_mut() = pos;
-        }
-        self.after_edit();
-    }
-
-    /// 复制当前选区（Ctrl+C）。
-    pub fn edit_copy(&mut self) {
-        let Some((s0, s1)) = self.selection() else {
-            return;
-        };
-        let text = self.edit_buffer().cloned().unwrap_or_default();
-        let picked: String = text.chars().skip(s0).take(s1 - s0).collect();
-        if !picked.is_empty() && !crate::fs::shell::set_clipboard_text(&picked) {
-            self.show_message("无法写入剪贴板");
-        }
-    }
-
-    /// 剪切当前选区（Ctrl+X）。
-    pub fn edit_cut(&mut self) {
-        self.edit_copy();
-        if let Some(pos) = self.edit_delete_selection() {
-            *self.caret_mut() = pos;
-            self.after_edit();
-        }
-    }
-
-    /// 粘贴（Ctrl+V），有选区时先替换掉。
-    pub fn edit_paste(&mut self) {
-        let Some(text) = crate::fs::shell::get_clipboard_text() else {
-            return;
-        };
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
-        if text.is_empty() {
-            return;
-        }
-        if let Some(pos) = self.edit_delete_selection() {
-            *self.caret_mut() = pos;
-        }
-        let caret = self.caret();
-        let new_caret = match self.edit_buffer_mut() {
-            Some(buf) => {
-                let chars: Vec<char> = buf.chars().collect();
-                let pos = caret.min(chars.len());
-                let mut s: String = chars[..pos].iter().collect();
-                s.push_str(&text);
-                s.extend(chars[pos..].iter());
-                let add = text.chars().count();
-                *buf = s;
-                pos + add
-            }
-            None => caret,
-        };
-        *self.caret_mut() = new_caret;
-        self.address_sel = None;
-        self.after_edit();
-    }
 
     // ------------------------------------------------------------ 内联重命名
 
@@ -2541,6 +2149,18 @@ impl Application {
         if hwnd_valid(self.hwnd) {
             unsafe {
                 InvalidateRect(self.hwnd, std::ptr::null(), 0);
+            }
+        }
+    }
+
+    /// 只让一块区域失效。
+    ///
+    /// 插入符闪烁是周期性事件（每 530ms 一次），以前每次都整窗重绘：
+    /// 标题栏、导航窗格、整页文件列表全部重画一遍，只为让一个 1px 竖线翻面。
+    pub fn request_repaint_rect(&self, r: RECT) {
+        if hwnd_valid(self.hwnd) {
+            unsafe {
+                InvalidateRect(self.hwnd, &r, 0);
             }
         }
     }
@@ -2572,6 +2192,23 @@ impl Application {
     ///
     /// 不再询问「确定关闭 N 个标签」：关闭按钮就该是关闭，确认框只会挡路。
     pub fn request_close(&mut self) {
+        // 「关闭提示」（原软件 CloseAlert）：多标签时确认一次，防误关。
+        // 确认框已开着就不重复弹（点确定/取消都在框上）；单标签直接关。
+        if self.cfg.settings.close_alter
+            && !self.closing
+            && self.tabs.len() > 1
+            && !matches!(
+                self.dialog.as_ref().map(|d| &d.intent),
+                Some(crate::ui::dialog::DialogIntent::ExitApp)
+            )
+        {
+            self.dialog_confirm(
+                S::ALERT_CLOSE_TITLE,
+                S::ALERT_CLOSE_BODY,
+                crate::ui::dialog::DialogIntent::ExitApp,
+            );
+            return;
+        }
         self.closing = true;
         unsafe {
             DestroyWindow(self.hwnd);
@@ -2692,6 +2329,15 @@ impl Application {
                 self.cfg.tags.save(&self.cfg.root);
                 self.rebuild_nav_rows();
             }
+            DialogIntent::ExitApp => {
+                // 「关闭提示」确认通过：closing 置位后 request_close
+                // 不再弹框，直接进销毁流程
+                self.closing = true;
+                unsafe {
+                    DestroyWindow(self.hwnd);
+                }
+                return;
+            }
         }
         self.request_repaint();
     }
@@ -2752,12 +2398,7 @@ impl Application {
         let Some(path) = crate::ui::detailtags::target_path(self) else {
             return;
         };
-        let Some(tag) = self.cfg.tags.list.get_mut(index) else {
-            return;
-        };
-        let before = tag.items.len();
-        tag.items.retain(|i| !crate::fs::same_path(&i.path, &path));
-        if tag.items.len() != before {
+        if self.cfg.tags.remove_item_by_path(index, &path) {
             self.cfg.tags.save(&self.cfg.root);
             self.rebuild_nav_rows();
             self.request_repaint();
@@ -2779,6 +2420,20 @@ impl Application {
     /// 现在统一走自绘对话框。
     pub fn show_message(&mut self, text: &str) {
         self.dialog_info(text);
+    }
+
+    /// 状态栏瞬态提示：不打断操作，几秒后自己消失。
+    ///
+    /// 高频动作的反馈用它（复制路径、切换排序等）；会阻塞交互、需要
+    /// 用户看见并确认的才走 `show_message`。
+    pub fn show_status_note(&mut self, text: &str) {
+        self.status_note = Some(text.to_string());
+        if hwnd_valid(self.hwnd) {
+            unsafe {
+                SetTimer(self.hwnd, TIMER_NOTE, NOTE_MS, None);
+            }
+        }
+        self.request_repaint();
     }
 
     /// 新开一个实例（`/OpenInNewWindow` 语义）。
@@ -2849,26 +2504,22 @@ impl Application {
             DestroyMenu(hmenu);
 
             match cmd {
-                ID_SHORTCUT => match crate::shell_integration::create_desktop_shortcut() {
-                    Ok(lnk) => self.dialog_info(&format!(
-                        "已在桌面创建快捷方式：\n{}\n\n双击即可启动 DreamFolder。",
-                        lnk.display()
-                    )),
-                    Err(e) => self.dialog_info(&format!("创建桌面快捷方式失败：\n{e}")),
-                },
+                ID_SHORTCUT => {
+                    // 成功不再弹窗：桌面上看到图标就是反馈
+                    if let Err(e) = crate::shell_integration::create_desktop_shortcut() {
+                        self.dialog_info(&e);
+                    }
+                }
                 ID_TAKEOVER => self.toggle_takeover(),
                 ID_SETTINGS => self.show_settings_dialog(),
                 ID_FEEDBACK => {
                     if let Err(e) = crate::fs::shell::open_url(S::FEEDBACK_URL) {
-                        self.dialog_info(&format!(
-                            "无法打开浏览器：{e}\n\n仓库地址：{}",
-                            S::FEEDBACK_URL
-                        ));
+                        self.dialog_info(&format!("无法打开浏览器：{e}"));
                     }
                 }
                 ID_ABOUT => {
                     self.dialog_info(&format!(
-                        "{}\n\n版本 {}\nRust + Win32（windows-sys 0.59）\n\n仓库：{}",
+                        "{} {}\n{}",
                         S::APP_NAME,
                         env!("CARGO_PKG_VERSION"),
                         S::FEEDBACK_URL
@@ -2880,10 +2531,6 @@ impl Application {
         }
     }
 
-    /// 文件列表的右键上下文菜单。
-    ///
-    /// 每一项都直接落到 `fs::shell` / `fs::ops` 已有的系统调用上；
-    /// 选中条目与空白处两套菜单，对应资源管理器的常规语义。
     /// 弹系统的 Shell 上下文菜单。
     ///
     /// 自己画菜单永远追不上系统：第三方扩展（压缩工具、版本控制、
@@ -2910,168 +2557,6 @@ impl Application {
         self.request_repaint();
     }
 
-    pub fn show_context_menu(&mut self) {        // 先把选中路径取成 owned 数据，后面才能自由地对 self 取可变借用
-        let paths = self.selected_paths();
-        let has_selection = !paths.is_empty();
-        let single_exe = paths.len() == 1
-            && paths[0]
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| {
-                    e.eq_ignore_ascii_case("exe")
-                        || e.eq_ignore_ascii_case("bat")
-                        || e.eq_ignore_ascii_case("cmd")
-                        || e.eq_ignore_ascii_case("com")
-                })
-                .unwrap_or(false);
-
-        const ID_OPEN: usize = 1;
-        const ID_OPEN_WITH: usize = 2;
-        const ID_RUN_AS: usize = 3;
-        const ID_PRINT: usize = 4;
-        const ID_REVEAL: usize = 5;
-        const ID_CUT: usize = 6;
-        const ID_COPY: usize = 7;
-        const ID_DELETE: usize = 8;
-        const ID_RENAME: usize = 9;
-        const ID_COPY_PATH: usize = 10;
-        const ID_PROPERTIES: usize = 11;
-        const ID_PASTE: usize = 12;
-        const ID_NEW_FOLDER: usize = 13;
-        const ID_REFRESH: usize = 14;
-        const ID_FOLDER_OPTIONS: usize = 15;
-
-        let cmd = unsafe {
-            let hmenu = CreatePopupMenu();
-            if hmenu.is_null() {
-                return;
-            }
-            let add = |id: usize, text: &str| {
-                let w = to_wide(text);
-                AppendMenuW(hmenu, MF_STRING, id, w.as_ptr());
-            };
-            let sep = || AppendMenuW(hmenu, MF_SEPARATOR, 0, std::ptr::null());
-
-            if has_selection {
-                add(ID_OPEN, "打开");
-                add(ID_OPEN_WITH, "打开方式...");
-                if single_exe {
-                    add(ID_RUN_AS, "以管理员身份运行");
-                }
-                add(ID_PRINT, "打印");
-                add(ID_REVEAL, "在资源管理器中显示");
-                sep();
-                add(ID_CUT, "剪切");
-                add(ID_COPY, "复制");
-                add(ID_DELETE, "删除");
-                add(ID_RENAME, "重命名");
-                add(ID_COPY_PATH, "复制路径");
-                sep();
-                add(ID_PROPERTIES, "属性");
-            } else {
-                add(ID_PASTE, "粘贴");
-                add(ID_NEW_FOLDER, "新建文件夹");
-                sep();
-                add(ID_REFRESH, "刷新");
-                sep();
-                add(ID_FOLDER_OPTIONS, "文件夹选项...");
-            }
-
-            let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
-            GetCursorPos(&mut pt);
-            // 菜单外壳由 uxtheme 画，弹之前把配色对齐到应用内主题
-            crate::win::init::apply_menu_theme();
-            let c = TrackPopupMenu(
-                hmenu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                pt.x,
-                pt.y,
-                0,
-                self.hwnd,
-                std::ptr::null(),
-            ) as usize;
-            DestroyMenu(hmenu);
-            c
-        };
-
-        // 选中条目才有效的单选类命令，统一取第一条
-        let first = || paths.first().cloned();
-
-        match cmd {
-            ID_OPEN => {
-                if let Some(&i) = self.active().and_then(|t| t.selected.iter().next()) {
-                    self.open_entry(i);
-                }
-            }
-            ID_OPEN_WITH => {
-                if let Some(p) = first() {
-                    if let Err(e) = shell::open_with_dialog(self.hwnd, &p) {
-                        self.show_message(&e);
-                    }
-                }
-            }
-            ID_RUN_AS => {
-                if let Some(p) = first() {
-                    if let Err(e) = shell::run_as_admin(self.hwnd, &p) {
-                        self.show_message(&e);
-                    }
-                }
-            }
-            ID_PRINT => {
-                if let Some(p) = first() {
-                    if let Err(e) = shell::print(self.hwnd, &p) {
-                        self.show_message(&e);
-                    }
-                }
-            }
-            ID_REVEAL => {
-                if let Some(p) = first() {
-                    if let Err(e) = shell::open_in_system_explorer(&p) {
-                        self.show_message(&e);
-                    }
-                }
-            }
-            ID_CUT => self.cut_selection(),
-            ID_COPY => self.copy_selection(),
-            ID_DELETE => self.delete_selection(false),
-            ID_RENAME => self.begin_rename_selection(),
-            ID_COPY_PATH => {
-                let text = paths
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join("\r\n");
-                if !shell::set_clipboard_text(&text) {
-                    self.show_message("无法写入剪贴板");
-                }
-            }
-            ID_PROPERTIES => {
-                if let Some(&i) = self.active().and_then(|t| t.selected.iter().next()) {
-                    self.show_properties_entry(i);
-                }
-            }
-            ID_PASTE => self.paste_into_active_tab(),
-            ID_NEW_FOLDER => {
-                if let Some(dir) = self.active().map(|t| t.path.clone()) {
-                    match ops::create_folder(&dir) {
-                        Ok(p) => {
-                            self.refresh_active_tab();
-                            self.select_by_path(&p);
-                        }
-                        Err(e) => self.show_message(&e),
-                    }
-                }
-            }
-            ID_REFRESH => self.refresh_active_tab(),
-            ID_FOLDER_OPTIONS => {
-                if let Err(e) = shell::open_folder_options() {
-                    self.show_message(&e);
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn toggle_takeover(&mut self) {
         use crate::shell_integration::{self, TakeoverState};
         use crate::ui::dialog::DialogIntent;
@@ -3081,7 +2566,7 @@ impl Application {
                 // 已接管 → 提供恢复。确认后由 `dialog_accept` 落动作
                 self.dialog_confirm(
                     S::MENU_TAKE_OVER_EXPLORER,
-                    "当前已接管系统文件管理。\n\n选择「确定」恢复系统默认，选择「取消」保持现状。",
+                    "确定恢复系统默认文件管理？",
                     DialogIntent::RestoreExplorer,
                 );
             }
@@ -3089,11 +2574,12 @@ impl Application {
                 Ok(scopes) => {
                     self.cfg.settings.replace_sysexplorer = true;
                     self.cfg.save_all();
-                    self.dialog_info(&shell_integration::takeover_report(&scopes));
+                    // 全部写成功了就不再弹窗：菜单项本身就是状态反馈
+                    if let Some(missing) = shell_integration::admin_missing(&scopes) {
+                        self.dialog_info(&format!("已接管；{missing} 需管理员权限"));
+                    }
                 }
-                Err(e) => self.dialog_info(&format!(
-                    "{e}\n\n提示：接管系统文件夹需要在管理员权限下运行本程序。"
-                )),
+                Err(e) => self.dialog_info(&e),
             },
         }
     }
@@ -3111,7 +2597,7 @@ impl Application {
     // ------------------------------------------------------------ 布局与命中
 
     pub fn recompute_layout(&mut self) {
-        let client = wnd::client_rect(self.hwnd);
+        let client = winwnd::client_rect(self.hwnd);
         self.layout = Layout::compute(
             client,
             self.dpi_scale,
@@ -3396,8 +2882,10 @@ impl Application {
                 if items.is_empty() {
                     return;
                 }
-                let res = crate::fs::ops::move_to(self.hwnd, &items, &target);
-                self.handle_op_result(res);
+                self.send_op(OpWhat::Move {
+                    items,
+                    target: target.clone(),
+                });
             }
             DropKind::Program => {
                 // 把拖过来的东西当命令行参数交给它——和资源管理器一致
@@ -3497,14 +2985,6 @@ impl Application {
     }
 }
 
-fn yesno(b: bool) -> &'static str {
-    if b {
-        "是"
-    } else {
-        "否"
-    }
-}
-
 /// 拖放落点解析出来的目标类型。
 enum DropKind {
     /// 文件夹：把拖来的东西移进去。
@@ -3570,427 +3050,4 @@ fn user_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("C:\\"))
 }
 
-// ------------------------------------------------------------------ 窗口过程
-
-/// 窗口过程。所有消息都转发到 `Application` 上的方法。
-unsafe extern "system" fn wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    // WM_NCCREATE 时把 Application 指针写入窗口
-    if msg == WM_NCCREATE {
-        let cs = lparam as *const CREATESTRUCTW;
-        if !cs.is_null() {
-            let p = (*cs).lpCreateParams as *mut Application;
-            wnd::set_user_data(hwnd, p);
-            if !p.is_null() {
-                (*p).hwnd = hwnd;
-            }
-        }
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
-    }
-
-    let app = wnd::user_data::<Application>(hwnd);
-    if app.is_null() {
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
-    }
-    let app = &mut *app;
-
-    match msg {
-        WM_CREATE => {
-            app.recompute_layout();
-            0
-        }
-        WM_SIZE => {
-            app.recompute_layout();
-            app.request_repaint();
-            0
-        }
-        WM_DPICHANGED => {
-            app.update_dpi(hwnd);
-            // 使用系统建议的窗口矩形
-            let sug = lparam as *const RECT;
-            if !sug.is_null() {
-                let r = *sug;
-                SetWindowPos(
-                    hwnd,
-                    std::ptr::null_mut(),
-                    r.left,
-                    r.top,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-            0
-        }
-        WM_PAINT => {
-            let mut ps: PAINTSTRUCT = std::mem::zeroed();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            if !hdc.is_null() {
-                let client = wnd::client_rect(hwnd);
-                let w = client.right - client.left;
-                let h = client.bottom - client.top;
-                if w > 0 && h > 0 {
-                    let mem = app.back_buffer.acquire(hdc, w, h);
-                    if !mem.is_null() {
-                        draw::paint(app, mem);
-                        app.back_buffer.blit_to(hdc, 0, 0, w, h);
-                    }
-                }
-            }
-            EndPaint(hwnd, &ps);
-            0
-        }
-        WM_ERASEBKGND => 1, // 背景由双缓冲覆盖，禁止系统擦除
-        WM_MOUSEMOVE => {
-            let x = lo_word(lparam);
-            let y = hi_word(lparam);
-            app.ensure_mouse_leave_tracking();
-            interact::on_mouse_move(app, x, y);
-            0
-        }
-        WM_MOUSELEAVE => {
-            app.tracking_mouse = false;
-            interact::on_mouse_leave(app);
-            0
-        }
-        WM_LBUTTONDOWN => {
-            let x = lo_word(lparam);
-            let y = hi_word(lparam);
-            SetCapture(hwnd);
-            interact::on_lbutton_down(app, x, y);
-            0
-        }
-        WM_LBUTTONUP => {
-            let x = lo_word(lparam);
-            let y = hi_word(lparam);
-            ReleaseCapture();
-            interact::on_lbutton_up(app, x, y);
-            0
-        }
-        // 自己处理右键抬起并返回 0，DefWindowProc 就不会再合成 WM_CONTEXTMENU，
-        // 从而避免菜单被弹出两次。
-        WM_RBUTTONUP => {
-            let x = lo_word(lparam);
-            let y = hi_word(lparam);
-            interact::on_rbutton_up(app, x, y);
-            0
-        }
-        WM_LBUTTONDBLCLK => {
-            let x = lo_word(lparam);
-            let y = hi_word(lparam);
-            interact::on_lbutton_dblclk(app, x, y);
-            0
-        }
-        WM_MBUTTONUP => {
-            let x = lo_word(lparam);
-            let y = hi_word(lparam);
-            interact::on_mbutton_up(app, x, y);
-            0
-        }
-        // 鼠标侧键：XBUTTON1 后退、XBUTTON2 前进。键号在 wParam 高字里。
-        WM_XBUTTONUP => {
-            match ((wparam >> 16) & 0xFFFF) as u16 {
-                1 => app.go_back(),
-                2 => app.go_forward(),
-                _ => {}
-            }
-            0
-        }
-        WM_MOUSEWHEEL => {
-            let delta = (wparam >> 16) as i16 as i32;
-            interact::on_mousewheel(app, delta);
-            0
-        }
-        WM_MOUSEHWHEEL => {
-            let delta = (wparam >> 16) as i16 as i32;
-            interact::on_hwheel(app, delta);
-            0
-        }
-        WM_KEYDOWN => {
-            // Alt 状态来自 GetKeyState
-            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_MENU};
-            app.modifiers.alt = (GetKeyState(VK_MENU as i32) as u16 & 0x8000) != 0;
-            interact::update_modifiers(app);
-            if interact::on_key_down(app, wparam) {
-                return 0;
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        WM_CHAR => {
-            let ch = wparam as u32;
-            if let Some(c) = char::from_u32(ch) {
-                interact::on_char(app, c);
-            }
-            0
-        }
-        WM_SETFOCUS => {
-            app.active_tab_focused = true;
-            app.request_repaint();
-            0
-        }
-        WM_KILLFOCUS => {
-            app.active_tab_focused = false;
-            app.request_repaint();
-            0
-        }
-        WM_DROPFILES => {
-            app.on_drop_files(wparam as *mut core::ffi::c_void);
-            0
-        }
-        crate::win::droptarget::WM_DREAMFOLDER_DROP => {
-            app.handle_external_drop();
-            0
-        }
-        WM_TIMER => {
-            if wparam == TIMER_CARET {
-                // 还有编辑态就催一帧重绘让插入符翻面；都结束了就自己停
-                let dialog_caret = app
-                    .dialog
-                    .as_ref()
-                    .map(|d| d.has_input())
-                    .unwrap_or(false);
-                if app.search_focused
-                    || app.address_editing
-                    || app.rename_target.is_some()
-                    || dialog_caret
-                {
-                    app.request_repaint();
-                } else {
-                    KillTimer(hwnd, TIMER_CARET);
-                }
-                return 0;
-            }
-            if wparam == TIMER_HOVER {
-                // 一次性：到点就停，只在指针仍停在该按钮上时才亮出提示条
-                KillTimer(hwnd, TIMER_HOVER);
-                if matches!(app.hover, ui::Hit::ToolbarButton(_)) {
-                    app.tooltip_ready = true;
-                    app.request_repaint();
-                }
-                return 0;
-            }
-            if wparam == TIMER_PIPE {
-                // 轮询单实例投递。先把报文取出来再操作 app：
-                // 管道借用活在 &mut app.pipe 上，直接在里面调 app 的方法会冲突。
-                let incoming = match &mut app.pipe {
-                    Some(pipe) => {
-                        if pipe.try_accept() {
-                            pipe.read_message()
-                        } else {
-                            None
-                        }
-                    }
-                    None => None,
-                };
-                if let Some(msg) = incoming {
-                    let (path, new_tab) = crate::ipc::parse_message(&msg);
-                    if let Some(p) = path {
-                        if new_tab {
-                            app.new_tab(Some(p));
-                        } else {
-                            app.navigate_to(p);
-                        }
-                    }
-                    // 把窗口带到前台
-                    SetForegroundWindow(hwnd);
-                }
-            }
-            0
-        }
-        WM_GETMINMAXINFO => {
-            let mmi = lparam as *mut MINMAXINFO;
-            if !mmi.is_null() {
-                let s = app.dpi_scale;
-                (*mmi).ptMinTrackSize.x =
-                    (ui::metrics::MIN_WINDOW_W as f32 * s).round() as i32;
-                (*mmi).ptMinTrackSize.y =
-                    (ui::metrics::MIN_WINDOW_H as f32 * s).round() as i32;
-            }
-            0
-        }
-        WM_NCCALCSIZE => {
-            // 无边框窗口：客户区必须等于整个窗口矩形。
-            //
-            // 返回值是关键——返回 1 才表示「lparam 里的 rgrc[0] 就是客户区」；
-            // 返回 0 会让系统按默认规则**再扣一次** WS_THICKFRAME 的调整边框，
-            // 于是客户区比窗口尺寸小一圈（左右各 8px 左右），布局在这个错误的
-            // 尺寸上计算，整页内容随之偏移、挤压。
-            if wparam == 0 {
-                // lParam 是 RECT*：无边框窗口基本不走这条，交给系统默认
-                return 0;
-            }
-            let params = lparam as *mut NCCALCSIZE_PARAMS;
-            if params.is_null() {
-                return 0;
-            }
-            if IsZoomed(hwnd) != 0 {
-                // 最大化时客户区取显示器**工作区**，否则会盖住任务栏
-                (*params).rgrc[0] = monitor_info(hwnd);
-            }
-            // 非最大化：保持系统传入的窗口矩形，即客户区铺满整个窗口
-            1
-        }
-        WM_NCHITTEST => {
-            // 允许拖动调整大小
-            let x = lo_word(lparam);
-            let y = hi_word(lparam);
-            let mut r: RECT = std::mem::zeroed();
-            GetWindowRect(hwnd, &mut r);
-            let border = (6.0 * app.dpi_scale).round() as i32;
-
-            let left = x < r.left + border;
-            let right = x >= r.right - border;
-            let top = y < r.top + border;
-            let bottom = y >= r.bottom - border;
-
-            let hit = if top && left {
-                HTTOPLEFT
-            } else if top && right {
-                HTTOPRIGHT
-            } else if bottom && left {
-                HTBOTTOMLEFT
-            } else if bottom && right {
-                HTBOTTOMRIGHT
-            } else if left {
-                HTLEFT
-            } else if right {
-                HTRIGHT
-            } else if top {
-                HTTOP
-            } else if bottom {
-                HTBOTTOM
-            } else {
-                HTCLIENT
-            };
-            return hit as LRESULT;
-        }
-        WM_SETCURSOR => {
-            // lParam 低字是 WM_NCHITTEST 的结果。
-            //
-            // 这里必须把每个 HT 都显式映射成光标：窗口类注册时用的是
-            // IDC_ARROW，而 DefWindowProc 只在「系统非客户区」里替我们挑
-            // 缩放光标；我们是无边框窗口、边框命中全由 WM_NCHITTEST 自己
-            // 决定，返回 0 让系统兜底的结果就是一直显示箭头。
-            let code = lo_word(lparam);
-            let cursor = match code {
-                x if x == HTLEFT as i32 || x == HTRIGHT as i32 => IDC_SIZEWE,
-                x if x == HTTOP as i32 || x == HTBOTTOM as i32 => IDC_SIZENS,
-                x if x == HTTOPLEFT as i32 || x == HTBOTTOMRIGHT as i32 => IDC_SIZENWSE,
-                x if x == HTTOPRIGHT as i32 || x == HTBOTTOMLEFT as i32 => IDC_SIZENESW,
-                x if x == HTCLIENT as i32 => {
-                    if app.resizing_nav
-                        || app.resizing_detail
-                        || app.drag_col.is_some()
-                        || app.hover == crate::ui::Hit::NavSplitter
-                        || app.hover == crate::ui::Hit::DetailSplitter
-                        || matches!(app.hover, crate::ui::Hit::DetailCol(_))
-                    {
-                        IDC_SIZEWE
-                    } else if app.address_editing || app.search_focused {
-                        IDC_IBEAM
-                    } else {
-                        IDC_ARROW
-                    }
-                }
-                _ => IDC_ARROW,
-            };
-            SetCursor(LoadCursorW(std::ptr::null_mut(), cursor));
-            1
-        }
-        WM_SETTINGCHANGE | WM_THEMECHANGED => {
-            app.recompute_layout();
-            app.request_repaint();
-            0
-        }
-        NAV_MSG => {
-            // 只加载最终目标，中间被覆盖掉的目标直接丢弃
-            if let Some(target) = app.pending_nav.take() {
-                app.load_into_active(target, false);
-            }
-            0
-        }
-        WM_CLOSE => {
-            app.request_close();
-            0
-        }
-        WM_DESTROY => {
-            app.save_state();
-            if app.pipe.is_some() {
-                KillTimer(hwnd, TIMER_PIPE);
-            }
-            PostQuitMessage(0);
-            0
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-/// 首次启动的窗口尺寸：按主显示器工作区推导。
-///
-/// 旧版本把 1000×640 硬编码在设置默认值里——那在 1080p 及以上的屏幕上偏小，
-/// 且完全不随屏幕变化。这里改成按工作区算，并夹在最小尺寸与工作区之间。
-///
-/// 注意：本函数在**窗口创建前**调用，此时没有 hwnd 可用，因此走
-/// `SystemParametersInfoW(SPI_GETWORKAREA)` 而不是 `MonitorFromWindow`。
-/// 它返回主显示器工作区，多屏下可能与鼠标所在屏不同，但只会影响首次启动的
-/// 一个初始位置，用户拖一次窗口后就被保存的几何取代。
-fn default_window_size() -> (i32, i32) {
-    /// 取不到工作区时的兜底（与旧默认值一致，至少不会崩）。
-    const FALLBACK: (i32, i32) = (1000, 640);
-
-    let mut work: RECT = unsafe { std::mem::zeroed() };
-    let ok = unsafe {
-        SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            &mut work as *mut RECT as *mut core::ffi::c_void,
-            0,
-        )
-    };
-    if ok == 0 {
-        return FALLBACK;
-    }
-
-    let ww = work.right - work.left;
-    let wh = work.bottom - work.top;
-    if ww <= 0 || wh <= 0 {
-        return FALLBACK;
-    }
-
-    // 宽取工作区的 5/8、高取 3/4：在 1920×1040 的工作区上得到 1200×780，
-    // 与资源管理器在 1080p 下打开时的观感接近。
-    let w = (ww * 5 / 8).clamp(ui::metrics::MIN_WINDOW_W, ww);
-    let h = (wh * 3 / 4).clamp(ui::metrics::MIN_WINDOW_H, wh);
-    (w, h)
-}
-
-unsafe fn monitor_info(hwnd: HWND) -> RECT {
-    let mut mi: MONITORINFO = std::mem::zeroed();
-    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-    let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    if GetMonitorInfoW(mon, &mut mi) != 0 {
-        mi.rcWork
-    } else {
-        std::mem::zeroed()
-    }
-}
-
-/// 取 lParam 低 16 位，**按有符号**解释（等价于 `GET_X_LPARAM`）。
-///
-/// 鼠标消息里的客户区坐标可以是负数：按下时 `SetCapture` 会持续把消息送进
-/// 窗口，用户把光标拖到客户区左上角外面，x/y 就是负值。按无符号读会变成
-/// 65xxx，框选的终点于是被夹到视图的**右下角**，整块选择框直接翻到对面
-/// （拖动翻页、拖动滚动条也一样会被这一下带偏）。
-fn lo_word(lparam: LPARAM) -> i32 {
-    (lparam & 0xFFFF) as i16 as i32
-}
-
-/// 取 lParam 高 16 位，按有符号解释（等价于 `GET_Y_LPARAM`）。理由同 [`lo_word`]。
-fn hi_word(lparam: LPARAM) -> i32 {
-    ((lparam >> 16) & 0xFFFF) as i16 as i32
-}
 

@@ -265,11 +265,6 @@ fn command_targets(cmd: &str, exe: &str) -> bool {
     program.eq_ignore_ascii_case(exe)
 }
 
-/// 兼容旧调用：是不是我们注册的。
-pub fn is_self_registered() -> bool {
-    matches!(state(), TakeoverState::Active)
-}
-
 // ------------------------------------------------------------------ 接管 / 恢复
 
 /// 在某个根下写入全部动词，并回读校验。
@@ -397,31 +392,21 @@ pub fn restore() -> Result<Vec<Scope>, String> {
 }
 
 /// 接管成功后给用户看的说明。
-pub fn takeover_report(scopes: &[Scope]) -> String {
-    let mut s = String::from("已接管系统文件管理：\n");
-    for scope in scopes {
-        s.push_str(&format!("· {}\n", scope.label()));
-    }
-    s.push_str("\n现在双击文件夹会用 DreamFolder 打开，右键菜单里也有「用 DreamFolder 打开」。\n");
-
-    let missing: Vec<Scope> = Scope::ALL
+/// 接管成功但部分范围没写入时，把缺的范围列出来（需要管理员权限的那些）。
+///
+/// 全部写成功时返回 `None`，调用方就不弹任何窗了。
+pub fn admin_missing(scopes: &[Scope]) -> Option<String> {
+    let names: Vec<&str> = Scope::ALL
         .iter()
         .copied()
-        .filter(|s| !scopes.contains(s))
+        .filter(|s| !scopes.contains(s) && s.needs_admin())
+        .map(|s| s.label())
         .collect();
-    if !missing.is_empty() {
-        let names: Vec<&str> = missing.iter().filter(|s| s.needs_admin()).map(|s| s.label()).collect();
-        if !names.is_empty() {
-            s.push_str(&format!(
-                "\n未写入：{}。已对当前用户生效；以管理员身份运行本程序可全机生效。",
-                names.join("、")
-            ));
-        }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join("、"))
     }
-    if scopes.iter().all(|s| s.needs_admin()) {
-        s.push_str("\n提示：当前用户范围未能写入，接管可能不会生效。");
-    }
-    s
 }
 
 // ------------------------------------------------------------------ 桌面快捷方式

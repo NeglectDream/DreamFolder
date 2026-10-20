@@ -169,41 +169,80 @@ pub fn search_index(scope: &str, key: &str, limit: usize) -> Result<Vec<Hit>, St
     if key.is_empty() || scope.is_empty() {
         return Ok(Vec::new());
     }
-    unsafe { search_inner(scope, key, limit.max(1)) }
-}
-
-unsafe fn search_inner(scope: &str, key: &str, limit: usize) -> Result<Vec<Hit>, String> {
-    // ---- 1) 拿到数据源并初始化
-    let mut init: *mut c_void = std::ptr::null_mut();
-    let hr = CoCreateInstance(
-        &CLSID_COLLATOR_DSO,
-        std::ptr::null_mut(),
-        CLSCTX_INPROC_SERVER,
-        &IID_IDB_INITIALIZE,
-        &mut init,
-    );
-    if hr != S_OK || init.is_null() {
-        return Err(format!("无法创建搜索数据源 (0x{:08X})", hr as u32));
+    match search_once(scope, key, limit.max(1)) {
+        Ok(hits) => Ok(hits),
+        Err(err) => {
+            // 复用的数据源可能已经失效（索引服务重启过、COM 被卸载）：
+            // 丢掉缓存重建一次再试。最坏情况与「每次重建连接」等价，
+            // 所以这个降级不会比原来更差。
+            drop_source();
+            search_once(scope, key, limit.max(1)).map_err(|_| err)
+        }
     }
-
-    let result = search_with(init, scope, key, limit);
-    release(init);
-    result
 }
 
+thread_local! {
+    /// 复用的搜索数据源。
+    ///
+    /// 搜索跑在后台 IO 线程上（`io::Job::Search`），线程是固定的一个，
+    /// 所以 `Search.CollatorDSO` 的数据源可以留着复用：以前每次搜索都要
+    /// `CoCreateInstance` + `Initialize` 走一遍，索引服务忙时要几十毫秒。
+    static SOURCE: std::cell::RefCell<Option<SourceHandle>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 数据源句柄的 RAII 包装：线程退出时释放。
+struct SourceHandle(*mut c_void);
+
+impl Drop for SourceHandle {
+    fn drop(&mut self) {
+        unsafe { release(self.0) };
+    }
+}
+
+fn drop_source() {
+    SOURCE.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// 用（必要时新建的）数据源跑一次查询。
+fn search_once(scope: &str, key: &str, limit: usize) -> Result<Vec<Hit>, String> {
+    SOURCE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if guard.is_none() {
+            let init = unsafe {
+                let mut init: *mut c_void = std::ptr::null_mut();
+                let hr = CoCreateInstance(
+                    &CLSID_COLLATOR_DSO,
+                    std::ptr::null_mut(),
+                    CLSCTX_INPROC_SERVER,
+                    &IID_IDB_INITIALIZE,
+                    &mut init,
+                );
+                if hr != S_OK || init.is_null() {
+                    return Err(format!("无法创建搜索数据源 (0x{:08X})", hr as u32));
+                }
+                // IDBInitialize::Initialize() —— 每个数据源只做一次
+                let f_init: unsafe extern "system" fn(*mut c_void) -> Hr = slot(init, 3);
+                if f_init(init) != S_OK {
+                    release(init);
+                    return Err("搜索数据源初始化失败".into());
+                }
+                init
+            };
+            *guard = Some(SourceHandle(init));
+        }
+        let init = guard.as_ref().map(|s| s.0).unwrap_or(std::ptr::null_mut());
+        unsafe { search_with(init, scope, key, limit) }
+    })
+}
+
+/// 在已初始化的数据源上跑一次查询：建会话 → 建命令 → 执行 → 读行集。
 unsafe fn search_with(
     init: *mut c_void,
     scope: &str,
     key: &str,
     limit: usize,
 ) -> Result<Vec<Hit>, String> {
-    // IDBInitialize::Initialize()
-    let f_init: unsafe extern "system" fn(*mut c_void) -> Hr = slot(init, 3);
-    let hr = f_init(init);
-    if hr != S_OK {
-        return Err(format!("搜索数据源初始化失败 (0x{:08X})", hr as u32));
-    }
-
     // ---- 2) 建会话 → 建命令
     let session = query_interface(init, &IID_IDB_CREATE_SESSION);
     if session.is_null() {

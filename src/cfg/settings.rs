@@ -226,6 +226,12 @@ pub struct Settings {
     pub show_nav_pane: bool,
     pub show_preview_pane: bool,
     pub show_detail_pane: bool,
+    /// 右侧详情窗格里「标签」模块排在文件明细**上方**。
+    ///
+    /// 默认 false：先看文件信息，标签在下面（与资源管理器的顺序相反，
+    /// 但标签是次要信息，不该把六行明细挤下去）。
+    #[serde(default)]
+    pub detail_tags_first: bool,
     pub show_extension: bool,
     pub show_hidden: bool,
     pub view_mode: ViewMode,
@@ -317,6 +323,7 @@ impl Default for Settings {
             show_preview_pane: false,
             // 新窗格默认开着：需求就是要它常驻在右侧
             show_detail_pane: true,
+            detail_tags_first: false,
             show_extension: true,
             show_hidden: false,
             view_mode: ViewMode::Medium,
@@ -392,33 +399,5 @@ impl Settings {
             let _ = std::fs::write(Self::file(root), text);
         }
     }
-
-    /// 内置默认快捷键表（对应原软件的「恢复默认快捷键」）。
-    /// 顺序即设置面板 HotKeyCollections 的显示顺序。
-    pub fn default_hotkeys() -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("新建标签", "Ctrl+T"),
-            ("关闭当前标签", "Ctrl+W"),
-            ("复制当前标签", "Ctrl+Shift+T"),
-            ("上一个标签", "Ctrl+PageUp"),
-            ("下一个标签", "Ctrl+PageDown"),
-            ("后退", "Alt+Left"),
-            ("前进", "Alt+Right"),
-            ("上一级", "Alt+Up"),
-            ("刷新", "F5"),
-            ("编辑地址栏", "Ctrl+L"),
-            ("搜索框", "Ctrl+F"),
-            ("新建文件夹", "Ctrl+Shift+N"),
-            ("重命名", "F2"),
-            ("删除", "Delete"),
-            ("复制", "Ctrl+C"),
-            ("剪切", "Ctrl+X"),
-            ("粘贴", "Ctrl+V"),
-            ("全选", "Ctrl+A"),
-            ("属性", "Alt+Enter"),
-            ("快速预览", "Space"),
-            ("切换视图", "Ctrl+1..8"),
-            ("新窗口", "Ctrl+N"),
-        ]
-    }
 }
+

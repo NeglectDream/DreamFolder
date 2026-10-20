@@ -93,17 +93,7 @@ impl NavPlaces {
         true
     }
 
-    /// 插到指定位置（拖动落点在中间时用）：
-    /// 落回末尾或越界就等同于追加。
-    pub fn insert_at(&mut self, index: usize, path: PathBuf) -> bool {
-        if self.index_of(&path).is_some() {
-            return false;
-        }
-        let at = index.min(self.items.len());
-        self.items.insert(at, NavPlace::new(path));
-        true
-    }
-
+    /// 拖到末尾（或越界）时等同于追加。
     pub fn remove_at(&mut self, index: usize) -> bool {
         if index < self.items.len() {
             self.items.remove(index);

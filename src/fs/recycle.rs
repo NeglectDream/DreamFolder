@@ -20,8 +20,6 @@ use super::entry::{Entry, EntryKind, IconKey};
 pub struct Slot {
     /// 数据本体（`$R...`），打开、看属性都用它。
     pub data: PathBuf,
-    /// 元数据（`$I...`），删除时要一起清掉。
-    pub meta: PathBuf,
     /// 删除前的完整路径。
     pub orig: PathBuf,
     /// 字节大小（目录为 0，与资源管理器口径一致）。
@@ -94,7 +92,6 @@ pub fn slots() -> Vec<Slot> {
                 }
                 out.push(Slot {
                     data,
-                    meta,
                     orig,
                     size,
                     deleted,
@@ -144,7 +141,6 @@ pub fn list() -> Vec<Entry> {
                 modified: slot.deleted,
                 created: slot.deleted,
                 accessed: slot.deleted,
-                attrs: if is_dir { 0x10 } else { 0 },
                 type_name: String::new(),
                 icon_key,
                 volume: None,
@@ -167,20 +163,4 @@ pub fn purge(data: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(meta);
     }
     res.map_err(|e| format!("{}: {e}", data.display()))
-}
-
-/// 清空回收站。
-pub fn empty() -> Result<(), String> {
-    let mut first_err = None;
-    for slot in slots() {
-        if let Err(e) = purge(&slot.data) {
-            if first_err.is_none() {
-                first_err = Some(e);
-            }
-        }
-    }
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
 }

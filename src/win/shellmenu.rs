@@ -15,7 +15,7 @@ use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::UI::Shell::{
-    CMINVOKECOMMANDINFOEX, CMF_NORMAL, SHBindToParent, SHParseDisplayName, ShellExecuteW,
+    CMINVOKECOMMANDINFOEX, CMF_NORMAL, SHBindToParent, SHParseDisplayName,
 };
 use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -276,20 +276,4 @@ unsafe fn popup_and_invoke(hwnd: HWND, pcm: *mut c_void) -> bool {
         vfn(pcm, ICM_INVOKE);
     let hr = invoke(pcm, &info);
     hr == 0
-}
-
-/// 用系统默认程序打开一个路径。菜单里「打开」之外的兜底路径。
-pub fn open_with_system(path: &Path) {
-    let wide = crate::win::to_wide(&path.to_string_lossy());
-    let op = crate::win::to_wide("open");
-    unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            op.as_ptr(),
-            wide.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        );
-    }
 }

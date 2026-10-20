@@ -51,40 +51,6 @@ pub unsafe fn register_class(
     RegisterClassExW(&wc)
 }
 
-/// 创建无边框主窗口。
-///
-/// # Safety
-/// 调用前必须已注册 `class_name` 对应的窗口类。
-pub unsafe fn create_popup_window(
-    class_name: &str,
-    title: &str,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    ex_style: u32,
-    style: u32,
-    param: *mut core::ffi::c_void,
-) -> HWND {
-    let class = to_wide(class_name);
-    let text = to_wide(title);
-
-    CreateWindowExW(
-        ex_style,
-        class.as_ptr(),
-        text.as_ptr(),
-        style,
-        x,
-        y,
-        w,
-        h,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        module_handle(),
-        param,
-    )
-}
-
 /// 标准消息循环。返回进程退出码。
 ///
 /// 使用 `GetMessageW` 的返回值三态语义：>0 正常、==0 收到 WM_QUIT、<0 出错。
@@ -108,17 +74,6 @@ pub fn client_rect(hwnd: HWND) -> RECT {
     let mut r: RECT = unsafe { std::mem::zeroed() };
     unsafe { GetClientRect(hwnd, &mut r) };
     r
-}
-
-/// 给窗口装应用图标（大/小/小2 三档）。
-///
-/// 图标由 `appicon` 从内嵌的 logo 现算，取不到时退化成系统图标。
-/// 返回的句柄是进程级共享的，**不要** `DestroyIcon`。
-///
-/// # Safety
-/// `hwnd` 必须是有效窗口句柄。
-pub unsafe fn apply_app_icon(hwnd: HWND) {
-    super::appicon::apply_to_window(hwnd);
 }
 
 /// 从 `explorer.exe` 里取资源管理器自己的大/小图标。

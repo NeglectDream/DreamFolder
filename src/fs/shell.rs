@@ -78,29 +78,9 @@ pub fn open_default(hwnd: HWND, path: &Path) -> Result<(), String> {
     }
 }
 
-/// 弹出「打开方式」选择器。
-pub fn open_with_dialog(hwnd: HWND, path: &Path) -> Result<(), String> {
-    invoke(hwnd, "openas", path, None)
-}
-
 /// 打开项目属性对话框。
 pub fn show_properties(hwnd: HWND, path: &Path) -> Result<(), String> {
     invoke(hwnd, "properties", path, None)
-}
-
-/// 以管理员身份运行。
-pub fn run_as_admin(hwnd: HWND, path: &Path) -> Result<(), String> {
-    invoke(hwnd, "runas", path, None)
-}
-
-/// 打印。
-pub fn print(hwnd: HWND, path: &Path) -> Result<(), String> {
-    invoke(hwnd, "print", path, None)
-}
-
-/// 在系统资源管理器中打开目录（对应菜单「接管系统文件管理」的反向操作）。
-pub fn open_in_system_explorer(path: &Path) -> Result<(), String> {
-    invoke(std::ptr::null_mut(), "open", path, None)
 }
 
 /// 打开 URL（http/https/mailto 等）。供菜单里的「反馈」使用。
@@ -161,39 +141,6 @@ pub fn run_with_program(program: &Path, args: &[std::path::PathBuf]) -> Result<(
             cwd.as_ref()
                 .map(|v| v.as_ptr())
                 .unwrap_or(std::ptr::null()),
-            SW_SHOWNORMAL,
-        )
-    };
-    if ret as isize > 32 {
-        Ok(())
-    } else {
-        Err(describe_shell_execute(ret as isize))
-    }
-}
-
-/// 打开控制面板的「文件夹选项」页面。
-///
-/// 原软件通过 `shell32.dll,Options_RunDLL` 调用（PE 字符串中的
-/// `name Microsoft.FolderOptions` 即为此用途）。
-/// 打开系统回收站。
-///
-/// 回收站是 Shell 命名空间里的虚拟目录，没有盘符路径可枚举，
-/// 走 `shell:RecycleBinFolder` 让系统自己开一个窗口是最稳的做法。
-pub fn open_recycle_bin(hwnd: HWND) -> Result<(), String> {
-    invoke(hwnd, "open", Path::new("shell:RecycleBinFolder"), None)
-}
-
-pub fn open_folder_options() -> Result<(), String> {
-    let verb = to_wide("open");
-    let file = to_wide("rundll32.exe");
-    let params = to_wide("shell32.dll,Options_RunDLL 0");
-    let ret = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            verb.as_ptr(),
-            file.as_ptr(),
-            params.as_ptr(),
-            std::ptr::null(),
             SW_SHOWNORMAL,
         )
     };

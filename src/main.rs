@@ -9,16 +9,12 @@
 
 #![windows_subsystem = "windows"] // 发布版不弹控制台；调试期见下方 cfg
 
-// 本项目是「行为对齐」式迁移：一批系统调用包装（自定义文件夹图标、
-// 缩略图缩放绘制、接管资源管理器的分用户重载、地址栏历史补全、
-// 书签编辑等）已经按原软件语义写好，只是尚未全部接进 UI 入口。
-// 它们不是遗留垃圾——删掉之后重新接线还要把 FFI 细节再写一遍，
-// 因此在这里集中声明一次，避免几十条 dead_code 噪音淹没真正的告警。
-#![allow(dead_code)]
+// 各模块不再依赖全局 dead_code 免检：接好线才保留，没接的当场删。
 
 mod app;
 mod cfg;
 mod fs;
+mod io;
 mod ipc;
 mod shell_integration;
 mod strings;

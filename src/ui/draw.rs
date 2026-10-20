@@ -8,7 +8,7 @@ use windows_sys::Win32::Graphics::Gdi::{HFONT, HDC};
 
 use crate::app::{Application, SearchState};
 use crate::cfg::settings::{SortKey, ViewMode};
-use crate::fs::entry::{Entry, EntryKind};
+use crate::fs::entry::Entry;
 use crate::fs::icons::IconSize;
 use crate::strings as S;
 use crate::win::paint::{rect, rect_contains, Canvas, Palette};
@@ -49,8 +49,6 @@ const ICON_FORWARD: &str = "\u{E72A}";
 const ICON_UP: &str = "\u{E74A}";
 const ICON_REFRESH: &str = "\u{E72C}";
 const ICON_SEARCH: &str = "\u{E721}";
-/// 「此电脑」分组里的驱动器图标。
-const ICON_DRIVE: &str = "\u{E88E}";
 /// 状态栏：详细列表视图。
 const ICON_VIEW_DETAIL: &str = "\u{E8FD}";
 /// 状态栏：大图标视图。
@@ -58,25 +56,19 @@ const ICON_VIEW_GRID: &str = "\u{E80A}";
 const TEXT_R: u32 = DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
 const TEXT_WRAP_C: u32 = DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX;
 
-/// 字体档位（对应 explorer_frame.xml 声明的 6 个 Font）。
+/// 字体档位（对应 explorer_frame.xml 声明的 Font）。
 pub mod font {
     pub const TAB: i32 = 12;
     pub const UI: i32 = 12;
-    pub const UI_BOLD: i32 = 12;
-    pub const TITLE: i32 = 13;
     pub const SMALL: i32 = 11;
     pub const STATUS: i32 = 11;
 }
 
-/// 绘制上下文：把绘制所需的可变借用打包，避免层层传参。
+/// 绘制上下文：把绘制所需的只读状态打包，避免层层传参。
 pub struct Painter<'a> {
-    pub canvas: &'a Canvas,
     pub layout: &'a Layout,
-    pub palette: &'a Palette,
     pub hover: Hit,
     pub pressed: Hit,
-    /// 当前鼠标位置（客户区坐标），用于面包屑这类细分热区。
-    pub mouse: (i32, i32),
 }
 
 impl<'a> Painter<'a> {
@@ -91,46 +83,72 @@ impl<'a> Painter<'a> {
     fn is_pressed(&self, h: Hit) -> bool {
         self.pressed == h
     }
-
-    /// 鼠标是否落在该矩形内。
-    fn contains(&self, r: RECT) -> bool {
-        let (x, y) = self.mouse;
-        x >= r.left && x < r.right && y >= r.top && y < r.bottom
-    }
 }
 
 /// 顶层绘制入口。返回后由调用方把离屏位图 BitBlt 上屏。
-pub fn paint(app: &mut Application, hdc: HDC) {
+///
+/// `dirty` 是这次真正需要重画的区域。离屏位图在两次 `WM_PAINT` 之间是
+/// 保留内容的，所以没脏的区域可以整块跳过——插入符每 530ms 闪一次，
+/// 以前每次都把标题栏、导航窗格、整个文件列表重画一遍，纯属白烧 CPU。
+/// 与脏区不相交的区域直接不画，它们留在位图里的还是上一帧的样子。
+pub fn paint(app: &mut Application, hdc: HDC, dirty: RECT) {
     // 先克隆需要的只读数据，避免 &mut app 与 &canvas 的借用冲突
     let layout = app.layout;
     let palette = *app.palette_for_theme();
     let hover = app.hover;
     let pressed = app.pressed;
 
-    // 背景
+    let hit = |r: RECT| rects_overlap(r, dirty);
+
+    // 背景：只刷脏区
     {
         let canvas = Canvas::new(hdc);
-        canvas.fill(layout.client, palette.window_bg);
+        canvas.fill(dirty, palette.window_bg);
     }
 
     // ---- 各区域 ----
-    paint_titlebar_and_tabs(app, hdc, &layout, &palette, hover, pressed);
-    paint_favbar(app, hdc, &layout, &palette, hover, pressed);
-    paint_toolbar(app, hdc, &layout, &palette, hover, pressed);
-    paint_navbar(app, hdc, &layout, &palette, hover, pressed);
+    if hit(layout.titlebar) {
+        paint_titlebar_and_tabs(app, hdc, &layout, &palette, hover, pressed);
+    }
+    if hit(layout.favbar) {
+        paint_favbar(app, hdc, &layout, &palette, hover, pressed);
+    }
+    if hit(layout.toolbar) {
+        paint_toolbar(app, hdc, &layout, &palette, hover, pressed);
+    }
+    if hit(layout.navbar) {
+        paint_navbar(app, hdc, &layout, &palette, hover, pressed);
+    }
     // 导航窗格画在文件视图之前：两者矩形本就不重叠（view.left 已让出 nav_w），
     // 但这个顺序能保证万一将来布局改动，窗格也不会被内容区盖住。
-    paint_nav_pane(app, hdc, &layout, &palette, hover, pressed);
-    paint_fileview(app, hdc, &layout, &palette);
-    paint_detail_pane(app, hdc, &layout, &palette);
-    paint_marquee(app, hdc, &layout, &palette);
-    paint_statusbar(app, hdc, &layout, &palette);
-    // 悬停提示要压在各区域之上（它会盖到导航栏/文件列表）
+    if hit(layout.nav_pane) {
+        paint_nav_pane(app, hdc, &layout, &palette, hover, pressed);
+    }
+    if hit(layout.view) {
+        paint_fileview(app, hdc, &layout, &palette);
+    }
+    if hit(layout.detail_pane) {
+        paint_detail_pane(app, hdc, &layout, &palette);
+    }
+    if hit(layout.view) {
+        paint_marquee(app, hdc, &layout, &palette);
+    }
+    if hit(layout.statusbar) {
+        paint_statusbar(app, hdc, &layout, &palette);
+    }
+    // 浮层跨区域：只要和脏区沾边就整块重画，否则脏区里被背景刷掉的那半截
+    // 浮层就再也补不回来了。
     paint_tooltip(app, hdc, &layout, &palette);
+    paint_addr_suggest(app, hdc, &layout, &palette, hover);
     // 模态层最后画，保证压在所有区域之上
     paint_settings(app, hdc, &layout, &palette);
     // 对话框比设置面板更靠上（命中测试也是先判它）
     paint_dialog(app, hdc, &layout, &palette);
+}
+
+/// 两个矩形是否有重叠。
+fn rects_overlap(a: RECT, b: RECT) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 
 /// 框选矩形。只画边和一层很淡的填充——填充太实会盖住底下的文件名。
@@ -163,12 +181,9 @@ fn paint_titlebar_and_tabs(
 ) {
     let canvas = Canvas::new(hdc);
     let p = Painter {
-        canvas: &canvas,
         layout,
-        palette,
         hover,
         pressed,
-        mouse: (app.mouse_x, app.mouse_y),
     };
 
     canvas.fill(layout.titlebar, palette.titlebar_bg);
@@ -367,12 +382,9 @@ fn paint_favbar(
     }
     let canvas = Canvas::new(hdc);
     let p = Painter {
-        canvas: &canvas,
         layout,
-        palette,
         hover,
         pressed,
-        mouse: (app.mouse_x, app.mouse_y),
     };
 
     canvas.fill(layout.favbar, palette.toolbar_bg);
@@ -501,12 +513,9 @@ fn paint_toolbar(
     }
     let canvas = Canvas::new(hdc);
     let p = Painter {
-        canvas: &canvas,
         layout,
-        palette,
         hover,
         pressed,
-        mouse: (app.mouse_x, app.mouse_y),
     };
 
     canvas.fill(layout.toolbar, palette.toolbar_bg);
@@ -604,12 +613,9 @@ fn paint_navbar(
 ) {
     let canvas = Canvas::new(hdc);
     let p = Painter {
-        canvas: &canvas,
         layout,
-        palette,
         hover,
         pressed,
-        mouse: (app.mouse_x, app.mouse_y),
     };
 
     canvas.fill(layout.navbar, palette.nav_bg);
@@ -684,9 +690,13 @@ fn paint_navbar(
             (tr, TEXT_L)
         };
         canvas.text(&text, draw_r, palette.text, font, flags);
-        if app.address_editing && caret_visible() {
+        if app.address_editing {
             let caret_x = xs.get(app.address_caret).copied().unwrap_or(tr.right - 2);
-            canvas.vline(caret_x, addr.top + p.s(6), addr.bottom - p.s(6), palette.text);
+            if caret_visible() {
+                canvas.vline(caret_x, addr.top + p.s(6), addr.bottom - p.s(6), palette.text);
+            }
+            // IME 锚点跟着插入符走（闪烁的隐相也要保持位置）
+            app.ime_anchor = Some((caret_x, addr.top + p.s(6)));
         }
         canvas.unclip(save);
     }
@@ -714,11 +724,11 @@ fn paint_navbar(
     canvas.text(ICON_SEARCH, glyph_r, palette.text_dim, font_icon, TEXT_C);
 
     let er = rect(glyph_r.right + p.s(2), sr.top, sr.right - p.s(8), sr.bottom);
-    let t = app.search_text.clone();
+    let t = app.search_text().to_string();
     // 插入符同样按真实字宽量前缀：搜索词里的中文是双宽，按固定字宽算会
     // 直接偏到前一个字中间；词比框宽时整体左移，让光标留在框内。
     let caret_px = if app.search_focused {
-        let prefix: String = t.chars().take(app.search_caret).collect();
+        let prefix: String = t.chars().take(app.search_caret()).collect();
         canvas.text_width(&prefix, font)
     } else {
         0
@@ -739,13 +749,16 @@ fn paint_navbar(
         };
         canvas.text(&t, draw_r, palette.text, font, flags);
         // 获焦时画插入符，按系统光标闪烁间隔明灭
-        if app.search_focused && caret_visible() {
-            canvas.vline(
-                er.left + caret_px - shift,
-                sr.top + p.s(6),
-                sr.bottom - p.s(6),
-                palette.text,
-            );
+        if app.search_focused {
+            if caret_visible() {
+                canvas.vline(
+                    er.left + caret_px - shift,
+                    sr.top + p.s(6),
+                    sr.bottom - p.s(6),
+                    palette.text,
+                );
+            }
+            app.ime_anchor = Some((er.left + caret_px - shift, sr.top + p.s(6)));
         }
         canvas.unclip(save);
     }
@@ -779,12 +792,9 @@ fn paint_nav_pane(
 
     let canvas = Canvas::new(hdc);
     let p = Painter {
-        canvas: &canvas,
         layout,
-        palette,
         hover,
         pressed,
-        mouse: (app.mouse_x, app.mouse_y),
     };
 
     canvas.fill(pane, palette.nav_bg);
@@ -1122,7 +1132,7 @@ fn paint_fileview(app: &mut Application, hdc: HDC, layout: &Layout, palette: &Pa
     if app.tabs[active].entries.is_empty() {
         let font = app.font_ui();
         let r = rect(vr.left + 16, vr.top + 16, vr.right - 16, vr.bottom - 16);
-        let hint = match app.search_state {
+        let hint = match app.search_state() {
             Some(SearchState::Running) => S::SEARCH_RUNNING,
             Some(SearchState::Done { hits: 0 }) => S::SEARCH_NO_RESULT,
             _ => S::STATUS_EMPTY_FOLDER,
@@ -1303,10 +1313,40 @@ fn paint_grid_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
                 continue;
             }
 
+            // 图标句柄要先取（icons 要 &mut），条目本身只借不可变引用。
+            // 图片文件在大/中图标视图优先画缩略图；没有现成的就发一次
+            // 后台解码请求，先用扩展名图标占位。
+            let entry = &app.tabs[active].entries[idx];
+            let thumb_views = matches!(view_mode, ViewMode::LargeEx | ViewMode::Large | ViewMode::Medium);
+            let icon = if thumb_views && entry.is_image() {
+                match app.thumbs.get(&entry.full) {
+                    Some(h) if h != 0 => h as *mut core::ffi::c_void,
+                    _ => {
+                        if app.thumbs.request(&entry.full) {
+                            app.io.send(crate::io::Job::Thumb {
+                                path: entry.full.clone(),
+                            });
+                        }
+                        resolve_icon(&mut app.icons, entry, IconSize::Large, icon_px)
+                    }
+                }
+            } else {
+                resolve_icon(&mut app.icons, entry, IconSize::Large, icon_px)
+            };
             paint_grid_cell(
-                app, canvas, r, idx,
-                view_mode, icon_px, font, font_small,
-                show_ext, &selection, palette, vr,
+                app,
+                canvas,
+                r,
+                entry,
+                icon,
+                idx,
+                view_mode,
+                icon_px,
+                font,
+                font_small,
+                show_ext,
+                &selection,
+                palette,
             );
         }
     }
@@ -1318,10 +1358,13 @@ fn paint_grid_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn paint_grid_cell(
-    app: &mut Application,
+    app: &Application,
     canvas: &Canvas,
     r: RECT,
+    entry: &Entry,
+    icon: *mut core::ffi::c_void,
     index: usize,
     view_mode: ViewMode,
     icon_px: i32,
@@ -1330,10 +1373,7 @@ fn paint_grid_cell(
     show_ext: bool,
     selection: &std::collections::HashSet<usize>,
     palette: &Palette,
-    view: RECT,
 ) {
-    let active = app.active_tab;
-    let entry = app.tabs[active].entries[index].clone();
     let selected = selection.contains(&index);
     let hovered = app.hover == Hit::ListItem(index);
     let focused = app.active_tab_focused;
@@ -1361,7 +1401,6 @@ fn paint_grid_cell(
             let isz = icon_px.min(inner.bottom - inner.top);
             let ix = inner.left + s(4);
             let iy = inner.top + (inner.bottom - inner.top - isz) / 2;
-            let icon = resolve_icon(app, &entry, IconSize::Large, isz);
             canvas.icon(icon, ix, iy, isz, isz);
 
             let tx = ix + isz + s(6);
@@ -1374,27 +1413,26 @@ fn paint_grid_cell(
             );
             canvas.text(&name, name_rect, palette.text, font, TEXT_L);
 
-            let detail = if entry.is_dir() {
-                app.icons.dir_type_name()
-            } else if !entry.type_name.is_empty() {
-                entry.type_name.clone()
-            } else {
-                app.icons.type_name(&entry.ext())
-            };
+            // 类型名在条目落地时就填好了，这里直接用
             let detail_rect = rect(
                 tx,
                 inner.top + s(24),
                 inner.right - s(2),
                 inner.top + s(24) + s(18),
             );
-            canvas.text(&detail, detail_rect, palette.text_dim, font_small, TEXT_L);
+            canvas.text(
+                &entry.type_name,
+                detail_rect,
+                palette.text_dim,
+                font_small,
+                TEXT_L,
+            );
         }
         _ => {
             // 图标在上，文字在下居中
             let isz = icon_px.min((inner.bottom - inner.top) - s(28)).max(s(16));
             let cx = (inner.left + inner.right) / 2;
             let iy = inner.top + s(6);
-            let icon = resolve_icon(app, &entry, IconSize::Large, isz);
             canvas.icon(icon, cx - isz / 2, iy, isz, isz);
 
             let name = entry.display_name(show_ext).to_string();
@@ -1407,8 +1445,6 @@ fn paint_grid_cell(
             canvas.text(&name, name_rect, palette.text, font, TEXT_WRAP_C);
         }
     }
-
-    let _ = view;
 }
 
 /// 行模式（列表 / 详细信息 / 内容）：一行一项，可带列。
@@ -1442,12 +1478,14 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
     // ---- 表头（仅详细信息模式）----
     let mut list_top = vr.top;
     let content_right = app.layout.content_right();
+    // 列宽只依赖布局与设置，与行无关：算一次给表头和所有行共用。
+    // 以前在逐行循环里重算，纯属每帧白算 N 遍。
+    let cols = app.layout.detail_columns(app.cfg.settings.detail_col_w);
 
     if show_ext_col {
         let hdr = rect(vr.left, vr.top, content_right, vr.top + row_h);
         canvas.fill(hdr, palette.header_bg);
 
-        let cols = app.layout.detail_columns(app.cfg.settings.detail_col_w);
         // 宽度不够时右侧列整列隐藏（放到可视区外），列头跟着一起藏
         let vis = |i: usize| app.layout.column_visible(cols[i]);
 
@@ -1509,7 +1547,7 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
         // 超出表头区域的裁剪
         let r = rect(r.left, r.top.max(list_top), r.right, r.bottom);
 
-        let entry = app.tabs[active].entries[idx].clone();
+        let entry = &app.tabs[active].entries[idx];
         let selected = selection.contains(&idx);
         let hovered = app.hover == Hit::ListItem(idx);
         let focused = app.active_tab_focused;
@@ -1530,15 +1568,14 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
         let isz = s(16);
         let ix = r.left + s(6);
         let iy = r.top + (r.bottom - r.top - isz) / 2;
-        let icon = resolve_icon(app, &entry, IconSize::Small, isz);
+        let icon = resolve_icon(&mut app.icons, entry, IconSize::Small, isz);
         canvas.icon(icon, ix, iy, isz, isz);
 
         if show_ext_col {
-            let cols = app.layout.detail_columns(app.cfg.settings.detail_col_w);
             let name_rect = rect(cols[0].0, r.top, cols[0].1 - s(8), r.bottom);
             if let Some((target, text, caret)) = &rename {
                 if *target == idx {
-                    draw_inline_edit(canvas, name_rect, text, *caret, palette, font);
+                    app.ime_anchor = Some(draw_inline_edit(canvas, name_rect, text, *caret, palette, font));
                 } else {
                     let name = entry.display_name(show_ext).to_string();
                     canvas.text(&name, name_rect, palette.text, font, TEXT_L);
@@ -1555,14 +1592,14 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
             }
 
             if vis(2) {
-                let kind = if entry.is_dir() {
-                    "文件夹".to_string()
-                } else if !entry.type_name.is_empty() {
-                    entry.type_name.clone()
-                } else {
-                    app.icons.type_name(&entry.ext())
-                };
-                canvas.text(&kind, rect(cols[2].0, r.top, cols[2].1 - s(8), r.bottom), palette.text_dim, font, TEXT_L);
+                // 类型名（目录是「文件夹」）在条目落地时就填好了
+                canvas.text(
+                    &entry.type_name,
+                    rect(cols[2].0, r.top, cols[2].1 - s(8), r.bottom),
+                    palette.text_dim,
+                    font,
+                    TEXT_L,
+                );
             }
 
             if vis(3) {
@@ -1573,7 +1610,7 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
             let name_rect = rect(ix + isz + s(6), r.top, r.right - s(8), r.bottom);
             if let Some((target, text, caret)) = &rename {
                 if *target == idx {
-                    draw_inline_edit(canvas, name_rect, text, *caret, palette, font);
+                    app.ime_anchor = Some(draw_inline_edit(canvas, name_rect, text, *caret, palette, font));
                 } else {
                     let name = entry.display_name(show_ext).to_string();
                     canvas.text(&name, name_rect, palette.text, font, TEXT_L);
@@ -1685,7 +1722,7 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
         // 有图有字就不画大图标了；预览不了（目录、未知类型）才回到图标
         if !drew {
             let isz = s(64);
-            let icon = resolve_icon(app, e, IconSize::Large, isz);
+            let icon = resolve_icon(&mut app.icons, e, IconSize::Large, isz);
             canvas.icon(
                 icon,
                 (pv.left + pv.right - isz) / 2,
@@ -1715,10 +1752,17 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
         canvas.text(labels[i], *r, fg, font, TEXT_C);
     }
 
-    // ---- 标签模块（在按钮与明细之间）----
-    let tags = crate::ui::detailtags::compute(app);
+    // ---- 两个内容模块：标签 / 文件明细，顺序由设置决定 ----
+    let sec = crate::ui::detailtags::sections(app);
+    let tags = &sec.tags;
     let row_h = s(metrics::DETAIL_ROW_H);
     let pad = s(12);
+
+    // 分隔线：按钮区下沿一条、两个模块之间一条
+    canvas.hline(p.left + pad, p.right - pad, sec.divider_buttons, palette.border_light);
+    if sec.divider_mid > sec.divider_buttons + s(4) {
+        canvas.hline(p.left + pad, p.right - pad, sec.divider_mid, palette.border_light);
+    }
 
     canvas.text(
         crate::strings::DETAIL_TAGS,
@@ -1727,7 +1771,7 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
         font,
         TEXT_L,
     );
-    // 「添加」小按钮：悬停才点亮，平时只描一条边，免得抢过上面的主按钮
+    // 「添加」chip：悬停才点亮，平时只描一条边，免得抢过上面的主按钮
     let add_hot = app.hover == Hit::DetailTagAdd;
     canvas.round_fill(
         tags.add,
@@ -1741,7 +1785,8 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
     );
     canvas.text("＋ 添加", tags.add, palette.text, font, TEXT_C);
 
-    if tags.rows.is_empty() {
+    if tags.chips.is_empty() {
+        // 第一行那格让给提示文字，「添加」chip 已经单独排在下一行居中
         canvas.text(
             crate::strings::TAG_NONE,
             rect(tags.label.right + s(6), tags.label.top, p.right - pad, tags.label.top + row_h),
@@ -1750,47 +1795,52 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
             TEXT_L,
         );
     }
-    for (i, r) in tags.rows.iter().enumerate() {
-        let (name, color) = app
+    for (i, c) in tags.chips.iter().enumerate() {
+        let Some((name, color)) = app
             .cfg
             .tags
             .list
-            .get(r.tag)
+            .get(c.tag)
             .map(|t| (t.name.clone(), t.color))
-            .unwrap_or_default();
+        else {
+            continue;
+        };
+        // 悬停整个 chip 一起点亮：叉太小，只亮叉会看不出这一格是活的
+        let hot = app.hover == Hit::DetailTagClose(i);
+        canvas.round_fill(
+            c.chip,
+            s(3),
+            if hot { palette.button_hover } else { palette.header_bg },
+            Some(palette.border_light),
+        );
         // 色点 + 名字：和导航窗格里的标签行是同一套视觉
-        let d = s(9);
+        let d = s(8);
         let dot = rect(
-            r.row.left,
-            r.row.top + (row_h - d) / 2,
-            r.row.left + d,
-            r.row.top + (row_h + d) / 2,
+            c.chip.left + s(8),
+            c.chip.top + (s(26) - d) / 2,
+            c.chip.left + s(8) + d,
+            c.chip.top + (s(26) + d) / 2,
         );
         canvas.round_fill(dot, d / 2, color, None);
         canvas.text(
             &name,
-            rect(dot.right + s(6), r.row.top, r.row.right, r.row.top + row_h),
+            rect(dot.right + s(6), c.chip.top, c.close.left - s(2), c.chip.bottom),
             palette.text,
             font,
             TEXT_L,
         );
-        let close_hot = app.hover == Hit::DetailTagClose(i);
         canvas.text(
             "×",
-            r.close,
-            if close_hot {
-                palette.accent
-            } else {
-                palette.text_dim
-            },
+            c.close,
+            if hot { palette.accent } else { palette.text_dim },
             font,
             TEXT_C,
         );
     }
 
-    // ---- 下：文件明细 ----
+    // ---- 文件明细 ----
     let label_w = s(64);
-    let mut y = tags.bottom;
+    let mut y = sec.info_top;
 
     let rows: Vec<(&str, String)> = match &entry {
         Some(e) => vec![
@@ -1852,6 +1902,7 @@ fn blank_dash(s: String) -> String {
 }
 
 /// 内联重命名编辑框。
+/// 返回插入符的客户区坐标，供调用点回填 IME 锚点（见 `ime_anchor`）
 fn draw_inline_edit(
     canvas: &Canvas,
     r: RECT,
@@ -1859,7 +1910,7 @@ fn draw_inline_edit(
     caret: usize,
     palette: &Palette,
     font: HFONT,
-) {
+) -> (i32, i32) {
     // 白底 + 强调色边框，与原软件输入框观感一致
     canvas.fill(r, 0x00FF_FFFF);
     canvas.border(r, palette.accent);
@@ -1880,34 +1931,65 @@ fn draw_inline_edit(
         font,
         TEXT_EDIT,
     );
-    canvas.vline(
-        inner.left + caret_px - shift,
-        r.top + 3,
-        r.bottom - 3,
-        palette.text,
-    );
+    let caret_x = inner.left + caret_px - shift;
+    canvas.vline(caret_x, r.top + 3, r.bottom - 3, palette.text);
     canvas.unclip(save);
+    (caret_x, r.top + 3)
 }
 
-/// 确保条目的图标键已解析，然后取图标。
+/// 取条目图标。
+///
+/// `icon_key` 已经在数据落地时填好了（见 `Application::fill_entry_meta`），
+/// 这里只是查缓存——所以参数是 `&mut IconCache` 而不是整个 `&mut Application`：
+/// 否则调用点为了拿一个图标句柄就得先把 Entry 克隆一份出来，而绘制本来就
+/// 只持有条目的不可变引用（一屏 30 行 × 每行 4 次分配的克隆）。
 fn resolve_icon(
-    app: &mut Application,
+    icons: &mut crate::fs::icons::IconCache,
     entry: &Entry,
     size: IconSize,
     px: i32,
 ) -> *mut core::ffi::c_void {
-    use crate::fs::icons::key_for;
-    // 懒解析：首次绘制时把 IconKey 从 Pending 补上
-    let key = match &entry.icon_key {
-        crate::fs::entry::IconKey::Pending => {
-            key_for(&entry.name, entry.is_dir(), entry.kind == EntryKind::Drive)
-        }
-        k => k.clone(),
-    };
     // 小图标档的源图只有 16px，界面放大后按 20px 以上绘制就会发糊。
     // 这种情况下改用大图标档（内部取的是 256px 源），缩放后依然清晰。
     let size = if px > 20 { IconSize::Large } else { size };
-    app.icons.get(&key, size)
+    icons.get(&entry.icon_key, size)
+}
+
+/// 地址栏历史下拉。
+///
+/// 编辑地址栏时把「最近去过的地方」按当前输入前缀匹配列出来，↓/↑ 选、
+/// 回车或点击跳过去。历史本身早在 `cfg::history` 里存着（`addr_history.ini`），
+/// 之前一直只写不读——有数据没有入口。
+fn paint_addr_suggest(
+    app: &mut Application,
+    hdc: HDC,
+    layout: &Layout,
+    palette: &Palette,
+    hover: Hit,
+) {
+    let _ = layout;
+    if !app.addr_suggest_open() {
+        return;
+    }
+    let canvas = Canvas::new(hdc);
+    let pane = app.addr_suggest_pane_rect();
+    let font = app.font_ui();
+    let sel = app.addr_suggest_sel;
+    let n = app.addr_suggest.len();
+    let pad = (8.0 * app.layout.scale).round() as i32;
+
+    canvas.round_fill(pane, 4, palette.header_bg, Some(palette.border));
+
+    for i in 0..n {
+        let r = app.addr_suggest_item_rect(i);
+        if sel == Some(i) {
+            canvas.fill(r, palette.item_selected);
+        } else if hover == Hit::AddrSuggest(i) {
+            canvas.fill(r, palette.item_hover);
+        }
+        let text_r = rect(r.left + pad, r.top, r.right - pad, r.bottom);
+        canvas.text(&app.addr_suggest[i], text_r, palette.text, font, TEXT_L);
+    }
 }
 
 /// 鼠标是否停在这个区域里。
@@ -1988,12 +2070,16 @@ fn paint_statusbar(app: &mut Application, hdc: HDC, layout: &Layout, palette: &P
 
     // 多选时的体积统计优先；否则按搜索状态说事——搜索时列表要么还是旧的、
     // 要么已被结果替换，光看「N 个项目」根本看不出搜索跑没跑、跑完了没有。
-    let text = if selected > 1 {
+    // 瞬态提示（「已复制路径」这类）最优先，它到点自己回落。
+    let text = if let Some(note) = app.status_note.clone() {
+        note
+    } else if selected > 1 {
         let hint = format_size_hint(app, selected);
         format!("{selected} {}{hint}", S::STATUS_ITEMS_SELECTED)
     } else {
-        match app.search_state {
+        match app.search_state() {
             Some(SearchState::Running) => S::SEARCH_RUNNING.to_string(),
+            Some(SearchState::TimedOut) => S::SEARCH_TIMEOUT.to_string(),
             Some(SearchState::Pending) => S::SEARCH_PRESS_ENTER.to_string(),
             Some(SearchState::Done { hits: 0 }) => S::SEARCH_NO_RESULT.to_string(),
             // 命中的按「匹配项」说，否则和普通目录的「N 个项目」分不清
@@ -2228,9 +2314,10 @@ fn paint_dialog(app: &mut Application, hdc: HDC, layout: &Layout, palette: &Pale
                 palette.text,
             );
         }
+        // 对话框输入框的 IME 锚点
+        app.ime_anchor = Some((tr.left + caret_px - shift, p.input.top + s(6)));
         canvas.unclip(save);
     }
-
     if has_input && colors {
         for (i, rgb) in dialog::TAG_COLORS.iter().enumerate() {
             let r = dialog::color_rect(app, i);

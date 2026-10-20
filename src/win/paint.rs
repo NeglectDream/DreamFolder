@@ -6,19 +6,74 @@
 //! 冷启动相关：`BackBuffer` 是**懒创建**的——首次 WM_PAINT 才分配 GDI 资源，
 //! 首帧之前不消耗任何句柄。
 
-use windows_sys::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
+use windows_sys::Win32::Foundation::{COLORREF, RECT, SIZE};
 // Gdi 通配同时提供 BeginPaint / EndPaint / PAINTSTRUCT / DrawTextW / CreateFontW 等
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL, HICON};
 
 use super::to_wide_raw;
 
+/// 缓存上限。正常主题只有几十个色值，超过这个数说明调用方在按像素调色，
+/// 那就别再涨了——清空重来。
+const SOLID_CACHE_MAX: usize = 384;
+
+thread_local! {
+    /// 纯色画刷缓存。
+    ///
+    /// `Canvas::fill` 一帧要被调用几百次（每行背景、每条分隔线、每个按钮），
+    /// 用到的颜色其实就那么二十来个；每次 `CreateSolidBrush` 都走一趟内核
+    /// 对象创建、用完再 `DeleteObject` 销毁，纯属浪费。画刷是进程级对象，
+    /// 可以跨 DC、跨帧一直复用。
+    static SOLID_BRUSHES: std::cell::RefCell<std::collections::HashMap<u32, HBRUSH>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// 纯色画笔缓存。理由同上，`round_fill` 每次都要一支。
+    static SOLID_PENS: std::cell::RefCell<std::collections::HashMap<u32, HPEN>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn solid_brush(color: u32) -> HBRUSH {
+    SOLID_BRUSHES.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if let Some(&h) = map.get(&color) {
+            return h;
+        }
+        if map.len() >= SOLID_CACHE_MAX {
+            for (_, h) in map.drain() {
+                unsafe {
+                    DeleteObject(h);
+                }
+            }
+        }
+        let h = unsafe { CreateSolidBrush(color) };
+        map.insert(color, h);
+        h
+    })
+}
+
+fn solid_pen(color: u32) -> HPEN {
+    SOLID_PENS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if let Some(&h) = map.get(&color) {
+            return h;
+        }
+        if map.len() >= SOLID_CACHE_MAX {
+            for (_, h) in map.drain() {
+                unsafe {
+                    DeleteObject(h);
+                }
+            }
+        }
+        let h = unsafe { CreatePen(PS_SOLID, 1, color) };
+        map.insert(color, h);
+        h
+    })
+}
+
 /// 界面配色。与 360FileBrowser_Theme.ui 中的十六进制色值一一对应。
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub window_bg: u32,
     pub titlebar_bg: u32,
-    pub tabbar_bg: u32,
     pub tab_active: u32,
     pub tab_inactive: u32,
     pub text: u32,
@@ -69,7 +124,6 @@ impl Palette {
     pub const LIGHT: Palette = Palette {
         window_bg: 0x00FF_FFFF,
         titlebar_bg: 0x00F3_F3F3,
-        tabbar_bg: 0x00F3_F3F3,
         tab_active: 0x00FF_FFFF,
         tab_inactive: 0x00F3_F3F3,
         text: 0x00_1B_1B1B,
@@ -111,7 +165,6 @@ impl Palette {
     pub const DARK: Palette = Palette {
         window_bg: 0x00_20_2020,
         titlebar_bg: 0x00_2B_2B2B,
-        tabbar_bg: 0x00_2B_2B2B,
         tab_active: 0x00_20_2020,
         tab_inactive: 0x00_2B_2B2B,
         text: 0x00FB_FB_FB,
@@ -163,11 +216,15 @@ impl BackBuffer {
     }
 
     /// 取一张尺寸匹配的离屏 DC，必要时重建位图。
-    pub fn acquire(&mut self, screen: HDC, w: i32, h: i32) -> HDC {
+    ///
+    /// 返回值第二项表示这块位图是不是**刚重建**的：重建意味着上一帧的内容
+    /// 已经没了，调用方必须按全窗重画，不能只画脏区。
+    pub fn acquire(&mut self, screen: HDC, w: i32, h: i32) -> (HDC, bool) {
         unsafe {
             if self.mem_dc.is_null() {
                 self.mem_dc = CreateCompatibleDC(screen);
             }
+            let mut recreated = false;
             if self.width != w || self.height != h || self.bitmap.is_null() {
                 if !self.bitmap.is_null() {
                     SelectObject(self.mem_dc, self.old_bitmap);
@@ -177,8 +234,9 @@ impl BackBuffer {
                 self.old_bitmap = SelectObject(self.mem_dc, self.bitmap);
                 self.width = w;
                 self.height = h;
+                recreated = true;
             }
-            self.mem_dc
+            (self.mem_dc, recreated)
         }
     }
 
@@ -218,10 +276,9 @@ impl Canvas {
 
     /// 用纯色填充矩形。
     pub fn fill(&self, r: RECT, color: u32) {
+        let brush = solid_brush(color);
         unsafe {
-            let brush = CreateSolidBrush(color);
             FillRect(self.hdc, &r, brush);
-            DeleteObject(brush);
         }
     }
 
@@ -284,10 +341,11 @@ impl Canvas {
     /// 方正的资源管理器风格，圆角反而成了噪音。
     pub fn round_fill(&self, r: RECT, radius: i32, fill_color: u32, border_color: Option<u32>) {
         let _ = radius;
+        // 画刷/画笔都走缓存：它们的销毁由缓存负责，这里不能 DeleteObject，
+        // 否则下一次命中缓存就拿到一个已释放的句柄。
+        let brush = solid_brush(fill_color);
+        let pen = solid_pen(border_color.unwrap_or(fill_color));
         unsafe {
-            let brush = CreateSolidBrush(fill_color);
-            let pen_color = border_color.unwrap_or(fill_color);
-            let pen = CreatePen(PS_SOLID, 1, pen_color);
             let old_brush = SelectObject(self.hdc, brush);
             let old_pen = SelectObject(self.hdc, pen);
 
@@ -295,8 +353,6 @@ impl Canvas {
 
             SelectObject(self.hdc, old_pen);
             SelectObject(self.hdc, old_brush);
-            DeleteObject(pen);
-            DeleteObject(brush);
         }
     }
 
@@ -446,26 +502,6 @@ impl Canvas {
             DrawIconEx(self.hdc, x, y, hicon, cx, cy, 0, std::ptr::null_mut(), DI_NORMAL);
         }
     }
-
-    /// 以线性插值缩放绘制位图（用于缩略图）。
-    pub fn stretch_blit(&self, src: HDC, r: RECT) {
-        unsafe {
-            SetStretchBltMode(self.hdc, HALFTONE as i32);
-            StretchBlt(
-                self.hdc,
-                r.left,
-                r.top,
-                r.right - r.left,
-                r.bottom - r.top,
-                src,
-                0,
-                0,
-                0,
-                0,
-                SRCCOPY,
-            );
-        }
-    }
 }
 
 /// 字体族。
@@ -569,19 +605,6 @@ impl Drop for FontCache {
     }
 }
 
-/// 用户区坐标。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PointI {
-    pub x: i32,
-    pub y: i32,
-}
-
-impl From<POINT> for PointI {
-    fn from(p: POINT) -> Self {
-        PointI { x: p.x, y: p.y }
-    }
-}
-
 /// 便捷：矩形包含判定。
 pub fn rect_contains(r: RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
@@ -597,39 +620,32 @@ pub fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
     }
 }
 
-/// 便捷：色值转换（我们的色值统一写成 0x00BBGGRR，与 COLORREF 一致）。
-pub fn colorref(c: u32) -> COLORREF {
-    c
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// 开始/结束绘制的守卫。
-pub struct PaintScope {
-    hwnd: HWND,
-    ps: PAINTSTRUCT,
-}
-
-impl PaintScope {
-    /// # Safety
-    /// 只能在 WM_PAINT 处理中调用。
-    pub unsafe fn begin(hwnd: HWND) -> Self {
-        let mut ps: PAINTSTRUCT = std::mem::zeroed();
-        BeginPaint(hwnd, &mut ps);
-        PaintScope { hwnd, ps }
+    /// 包含判定是「左上闭、右下开」，相邻矩形不会同时命中同一点。
+    #[test]
+    fn rect_contains_is_half_open() {
+        let r = rect(10, 20, 30, 40);
+        assert!(rect_contains(r, 10, 20));
+        assert!(rect_contains(r, 29, 39));
+        assert!(!rect_contains(r, 30, 20));
+        assert!(!rect_contains(r, 10, 40));
+        assert!(!rect_contains(r, 9, 20));
     }
 
-    pub fn hdc(&self) -> HDC {
-        self.ps.hdc
+    /// 空矩形（宽或高为 0）不含任何点。
+    #[test]
+    fn empty_rect_contains_nothing() {
+        assert!(!rect_contains(rect(5, 5, 5, 5), 5, 5));
+        assert!(!rect_contains(rect(0, 0, 0, 100), 0, 50));
     }
 
-    pub fn rect(&self) -> RECT {
-        self.ps.rcPaint
-    }
-}
-
-impl Drop for PaintScope {
-    fn drop(&mut self) {
-        unsafe {
-            EndPaint(self.hwnd, &self.ps);
-        }
+    /// `rect` 的四个字段按参数就位（自绘代码全靠它拼矩形）。
+    #[test]
+    fn rect_fields_are_in_order() {
+        let r = rect(1, 2, 3, 4);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (1, 2, 3, 4));
     }
 }

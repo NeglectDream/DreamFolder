@@ -85,8 +85,6 @@ pub struct NavRow {
     pub kind: NavKind,
     /// 行矩形（屏幕坐标，已含缩进与滚动偏移）。
     pub rect: RECT,
-    /// 缩进层级，0 为顶层。
-    pub depth: i32,
     /// 是否画展开箭头。
     pub expandable: bool,
     /// 箭头是否为展开态。
@@ -168,7 +166,6 @@ impl Cursor {
         self.items.push(NavRow {
             kind,
             rect: rect(self.pane.left + indent, top, self.right, top + h),
-            depth,
             expandable,
             expanded,
             volume: None,
@@ -186,7 +183,6 @@ impl Cursor {
         self.items.push(NavRow {
             kind: NavKind::Separator { section },
             rect: rect(self.pane.left, top, self.right, top + h),
-            depth: 0,
             expandable: false,
             expanded: false,
             volume: None,
@@ -359,7 +355,8 @@ fn assemble_tags(c: &mut Cursor, app: &Application) {
                     path: entry.path.clone(),
                     color: tag.color,
                 },
-                1,
+                // 与普通目录行同层缩进：条目自己带色点，不再靠缩进表达层级
+                0,
                 false,
                 false,
             );

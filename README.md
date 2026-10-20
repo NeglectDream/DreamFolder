@@ -145,9 +145,9 @@ reg add "HKU\.DEFAULT\Software\Classes\Folder\shell\newwindow\command" /ve /d "\
 | 后退 / 前进 / 向上 | [src/app.rs](src/app.rs) `go_back` / `go_forward` / `go_up` | 已实现 |
 | 历史记录下拉 | [src/cfg/history.rs](src/cfg/history.rs) | 数据完成，下拉 UI 待做 |
 | 地址栏（面包屑 ⇄ 编辑框） | [src/ui/draw.rs](src/ui/draw.rs) `paint_breadcrumb` | 已实现 |
-| 搜索（快速 / 系统 / 网络三模式） | [src/app.rs](src/app.rs) `SearchMode` | 快速搜索已实现 |
+| 搜索（回车触发，索引 → 子树 → 已加载 三级回退） | [src/app.rs](src/app.rs) `begin_search` | 已实现 |
 | 8 种视图（超大/大/中/小图标、列表、详细信息、平铺、内容） | [src/ui/draw.rs](src/ui/draw.rs) `paint_grid_view` / `paint_rows_view` | 已实现 |
-| 显示选项（导航/预览/详情窗格、扩展名、隐藏项） | [src/cfg/settings.rs](src/cfg/settings.rs) | 配置就绪，窗格绘制待做 |
+| 显示选项（导航/预览/详情窗格、扩展名、隐藏项） | [src/cfg/settings.rs](src/cfg/settings.rs) + [src/ui/settingspane.rs](src/ui/settingspane.rs) | 已实现 |
 | 工具栏操作（新建/剪切/复制/粘贴/删除/重命名/视图…） | [src/app.rs](src/app.rs) `toolbar_action` | 已实现 |
 | 文件操作（回收站删除、复制、移动、重命名、新建） | [src/fs/ops.rs](src/fs/ops.rs) | 已实现（走 SHFileOperation） |
 | 空格键快速预览 | [src/app.rs](src/app.rs) `quick_preview_selection` | 文本文件已实现 |
@@ -361,14 +361,13 @@ Profile\
 - 拖放接收
 
 ### 已实现但较简化
-- **设置对话框**：当前用系统 `MessageBox` 承载摘要；原软件的 `DlgSetting.xml` 多页面板需要自绘控件树，属于后续迭代
-- **快速预览**：文本文件（<1 MiB）在对话框中显示前 12 行；原软件的富预览需要图像/文档解码
+- **设置面板**：自绘单页面板（[src/ui/settingspane.rs](src/ui/settingspane.rs)），按行切换开关；原软件的 `DlgSetting.xml` 是多页选项卡
+- **快速预览**：文本文件（<256 KiB、前 400 行）与图片在详情窗格里显示；文档类富预览需要额外解码器
 - **主菜单**：用系统 `TrackPopupMenu` 实现，保证键盘可达性；原软件是自绘菜单
-- **搜索**：快速搜索（当前目录名称过滤）已实现；系统搜索需索引 API，网络搜索需 URL 模板配置
+- **搜索**：回车触发，先查 Windows 搜索索引，不可用时降级为当前目录子树扫描（400 ms 预算），再退到「已加载条目里按名称包含」；网络搜索未实现
 
 ### 尚未实现
 - 历史记录下拉列表 UI
-- 导航窗格 / 预览窗格 / 详细信息窗格的实际绘制
 - 引导页
 - 更新检测
 - 缩略图（需缩略图缓存 API）

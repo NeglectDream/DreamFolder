@@ -6,7 +6,7 @@
 //!   3. 只做一次 `Vec` 预留，避免反复扩容
 //!   4. 排序在枚举线程完成，UI 线程不做 N log N
 
-use windows_sys::Win32::Foundation::{FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     FindClose, FindFirstFileExW, FindNextFileW, FindExInfoBasic, FindExSearchNameMatch,
     WIN32_FIND_DATAW, FIND_FIRST_EX_LARGE_FETCH,
@@ -73,8 +73,6 @@ impl Default for ListOptions {
 /// 枚举结果。
 pub struct Listing {
     pub entries: Vec<Entry>,
-    /// 因权限/占用等原因被跳过的条目数（非 0 时状态栏可提示）。
-    pub skipped: usize,
 }
 
 /// 枚举目录内容。
@@ -130,7 +128,7 @@ pub fn list_dir(dir: &Path, opts: &ListOptions) -> Result<Listing, String> {
 
     // 预估容量：目录条目数常在 10~2000，先给 64 起步能减少多数扩容
     let mut entries: Vec<Entry> = Vec::with_capacity(64);
-    let mut skipped = 0usize;
+
 
     loop {
         let name = crate::win::from_wide(&data.cFileName);
@@ -180,17 +178,21 @@ pub fn list_dir(dir: &Path, opts: &ListOptions) -> Result<Listing, String> {
                 // 这里仅正常列出。
                 let _ = FILE_ATTRIBUTE_REPARSE_POINT;
 
+                // 图标键是纯字符串计算（扩展名小写），枚举时就定死；
+                // exe/lnk 这些要按完整路径取图标，所以得先有 full。
+                let full = PathBuf::from(format!("{dir_prefix}{name}"));
+                let icon_key =
+                    super::icons::key_for_entry(&name, &full, kind == EntryKind::Directory, false);
                 entries.push(Entry {
-                    full: PathBuf::from(format!("{dir_prefix}{name}")),
+                    full,
                     name,
                     kind,
                     size,
                     modified,
                     created,
                     accessed,
-                    attrs,
                     type_name: String::new(),
-                    icon_key: IconKey::Pending,
+                    icon_key,
                     // 容量只对驱动器有意义，普通枚举不查盘
                     volume: None,
                 });
@@ -204,7 +206,6 @@ pub fn list_dir(dir: &Path, opts: &ListOptions) -> Result<Listing, String> {
 
         // 防御：极端情况下（如设备目录）条数异常时截断
         if entries.len() > 200_000 {
-            skipped += 1;
             break;
         }
     }
@@ -215,44 +216,38 @@ pub fn list_dir(dir: &Path, opts: &ListOptions) -> Result<Listing, String> {
 
     sort_entries(&mut entries, &opts.sort);
 
-    Ok(Listing { entries, skipped })
+    Ok(Listing { entries })
 }
 
 /// 枚举「此电脑」视图：驱动器列表。
+///
+/// 刻意只列盘符，**不查**卷标和容量：`GetVolumeInformationW` 和
+/// `GetDiskFreeSpaceExW` 都是同步系统调用，遇到离线的映射网络盘会等
+/// 几十秒 SMB 超时。以前这些都在 UI 线程上做，打开「此电脑」就像死机。
+/// 现在由后台补查（`io::Job::Volumes`），查到一个回填一个。
 pub fn list_computer(opts: &ListOptions) -> Listing {
     let mut entries = Vec::with_capacity(8);
     for d in super::drives() {
-        let label = drive_label(&d);
-        let name = if label.is_empty() {
-            d.to_string_lossy().into_owned()
-        } else {
-            format!("{} ({})", label, d.to_string_lossy().trim_end_matches('\\'))
-        };
         entries.push(Entry {
-            name,
-            full: d.clone(),
+            // 先只显示盘符（`C:`），卷标到了再换成「本地磁盘 (C:)」
+            name: d.to_string_lossy().trim_end_matches('\\').to_string(),
+            full: d,
             kind: EntryKind::Drive,
             size: 0,
             modified: 0,
             created: 0,
             accessed: 0,
-            attrs: FILE_ATTRIBUTE_DIRECTORY,
             type_name: "本地磁盘".to_string(),
             icon_key: IconKey::Drive,
-            volume: volume_of(&d),
+            volume: None,
         });
     }
     // 「此电脑」固定按盘符字母顺序排，不跟随列表当前的排序方式——
     // 资源管理器就是这个行为，盘符顺序也是找盘的第一直觉。
-    // 卷标各机器不同，按名字排会让 C/D/E 打乱成看似随机的次序。
-    entries.sort_by(|a, b| {
-        a.full
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .cmp(&b.full.to_string_lossy().to_ascii_uppercase())
-    });
+    // key 先算好：比较函数里现算会为每次比较分配两个 String。
+    entries.sort_by_cached_key(|a| a.full.to_string_lossy().to_ascii_uppercase());
     let _ = opts;
-    Listing { entries, skipped: 0 }
+    Listing { entries }
 }
 
 /// 查询驱动器容量。
@@ -317,49 +312,70 @@ pub fn drive_label(drive: &Path) -> String {
 }
 
 /// 排序：目录恒在文件之前，随后按选定键比较。
+///
+/// 比较用的 key 一律**先算一遍再排**：如果放在比较函数里现算，
+/// `to_lowercase()` / `ext()` 会被调用几十万次（1 万条目 ≈ 13 万次比较，
+/// 每次 2 个 String 分配），打开大目录时这部分比枚举本身还贵。
 pub fn sort_entries(entries: &mut [Entry], sort: &Sort) {
-    entries.sort_by(|a, b| {
-        // 1) 目录优先（始终升序，不受 descending 影响——资源管理器行为）
-        let a_dir = a.is_dir();
-        let b_dir = b.is_dir();
-        if a_dir != b_dir {
-            return if a_dir {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
-            };
+    use std::cmp::Ordering;
+
+    let n = entries.len();
+    if n < 2 {
+        return;
+    }
+    let names: Vec<String> = entries.iter().map(|e| e.sort_name_key()).collect();
+    let kinds: Vec<String> = match sort.key {
+        SortKey::Kind => entries.iter().map(|e| e.ext()).collect(),
+        _ => Vec::new(),
+    };
+
+    let src: &[Entry] = entries;
+    let dir_ord = |a: &Entry, b: &Entry| -> Ordering {
+        match (a.is_dir(), b.is_dir()) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => Ordering::Equal,
         }
+    };
 
-        // 2) 选定键
+    // 先排下标，最后按置换把条目就位：比较时不碰条目本身，借用冲突最小
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    idx.sort_by(|&a, &b| {
+        let (ia, ib) = (a as usize, b as usize);
+        // 目录优先，且不受「降序」影响（资源管理器行为）
+        let dir = dir_ord(&src[ia], &src[ib]);
+        if dir != Ordering::Equal {
+            return dir;
+        }
         let ord = match sort.key {
-            SortKey::Name => a.sort_name_key().cmp(&b.sort_name_key()),
-            SortKey::Size => a.size.cmp(&b.size),
-            SortKey::Kind => {
-                let ka = a.ext();
-                let kb = b.ext();
-                ka.cmp(&kb).then_with(|| a.sort_name_key().cmp(&b.sort_name_key()))
-            }
-            SortKey::Modified => a.modified.cmp(&b.modified),
+            SortKey::Name => names[ia].cmp(&names[ib]),
+            SortKey::Size => src[ia].size.cmp(&src[ib].size),
+            SortKey::Kind => kinds[ia]
+                .cmp(&kinds[ib])
+                .then_with(|| names[ia].cmp(&names[ib])),
+            SortKey::Modified => src[ia].modified.cmp(&src[ib].modified),
         };
-
-        // 3) 同值时用名称兜底，保证稳定可预期
-        let ord = if ord == std::cmp::Ordering::Equal && sort.key != SortKey::Name {
-            a.sort_name_key().cmp(&b.sort_name_key())
+        // 同值时用名称兜底，保证稳定可预期
+        let ord = if ord == Ordering::Equal && sort.key != SortKey::Name {
+            names[ia].cmp(&names[ib])
         } else {
             ord
         };
-
         if sort.descending {
             ord.reverse()
         } else {
             ord
         }
     });
-}
 
-/// 供 UI 线程直接调用的小工具：把 FILETIME 结构转 u64。
-pub fn ft64(ft: &FILETIME) -> u64 {
-    filetime_from_parts(ft.dwLowDateTime, ft.dwHighDateTime)
+    // 按下标置换把条目换到目标位置（每个元素最多换一次）
+    for i in 0..n {
+        while idx[i] as usize != i {
+            let j = idx[i] as usize;
+            entries.swap(i, j);
+            idx.swap(i, j);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 搜索结果
@@ -387,6 +403,7 @@ pub fn entry_from_path(path: &Path) -> Option<Entry> {
     };
 
     let written = meta.last_write_time();
+    let icon_key = super::icons::key_for_entry(&name, path, is_dir, false);
     Some(Entry {
         full: path.to_path_buf(),
         name,
@@ -398,35 +415,44 @@ pub fn entry_from_path(path: &Path) -> Option<Entry> {
         created: filetime_from_parts(meta.creation_time() as u32, (meta.creation_time() >> 32) as u32),
         #[allow(clippy::cast_possible_truncation)]
         accessed: filetime_from_parts(meta.last_access_time() as u32, (meta.last_access_time() >> 32) as u32),
-        attrs: meta.file_attributes(),
         type_name: String::new(),
-        icon_key: IconKey::Pending,
+        icon_key,
         volume: None,
     })
 }
 
 /// 索引不可用时的降级路径：在 `root` 子树内按文件名包含关系查找。
 ///
-/// 语义与「资源管理器关掉索引后的搜索」一致——递归遍历。为避免 UI 卡死，
-/// 这里有硬上限：最多返回 `limit` 条、最多运行 `budget_ms` 毫秒，
-/// 且不跟随符号链接（防止目录环）。
-pub fn scan_subtree(root: &Path, key: &str, limit: usize, budget_ms: u32) -> Vec<Entry> {
+/// 语义与「资源管理器关掉索引后的搜索」一致——递归遍历。为避免长时间占用
+/// 后台线程，这里有硬上限：最多返回 `limit` 条、最多运行 `budget_ms` 毫秒、
+/// 且不跟随符号链接（防止目录环）。`cancelled` 每次循环都会问一遍，
+/// 用户改了搜索词或换了目录就能立刻收手。
+pub fn scan_subtree(
+    root: &Path,
+    key: &str,
+    limit: usize,
+    budget_ms: u32,
+    cancelled: &dyn Fn() -> bool,
+) -> Vec<Entry> {
     use windows_sys::Win32::System::SystemInformation::GetTickCount;
 
     let needle = key.to_lowercase();
     let start = unsafe { GetTickCount() };
     let mut out: Vec<Entry> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    let stop = |out_len: usize| -> bool {
+        out_len >= limit || unsafe { GetTickCount() }.wrapping_sub(start) > budget_ms
+    };
 
     while let Some(dir) = stack.pop() {
-        if out.len() >= limit || unsafe { GetTickCount() }.wrapping_sub(start) > budget_ms {
+        if stop(out.len()) || cancelled() {
             break;
         }
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
         for item in rd.flatten() {
-            if out.len() >= limit || unsafe { GetTickCount() }.wrapping_sub(start) > budget_ms {
+            if stop(out.len()) || cancelled() {
                 break;
             }
             let Ok(ft) = item.file_type() else { continue };
@@ -444,4 +470,92 @@ pub fn scan_subtree(root: &Path, key: &str, limit: usize, budget_ms: u32) -> Vec
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::entry::{Entry, EntryKind, IconKey};
+
+    fn e(name: &str, kind: EntryKind, size: u64, modified: u64) -> Entry {
+        Entry {
+            name: name.to_string(),
+            full: PathBuf::from(format!("C:/dir/{name}")),
+            kind,
+            size,
+            modified,
+            created: 0,
+            accessed: 0,
+            type_name: String::new(),
+            icon_key: IconKey::Pending,
+            volume: None,
+        }
+    }
+
+    fn names(entries: &[Entry]) -> Vec<&str> {
+        entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// 名称排序不分大小写，且目录永远在前（即使按降序）。
+    #[test]
+    fn sort_name_is_case_insensitive_and_dirs_first() {
+        let mut items = vec![
+            e("beta.txt", EntryKind::File, 0, 0),
+            e("Alpha", EntryKind::Directory, 0, 0),
+            e("gamma.txt", EntryKind::File, 0, 0),
+        ];
+        sort_entries(
+            &mut items,
+            &Sort { key: SortKey::Name, descending: false },
+        );
+        assert_eq!(names(&items), ["Alpha", "beta.txt", "gamma.txt"]);
+
+        // 降序：文件倒过来，目录仍在最前
+        sort_entries(
+            &mut items,
+            &Sort { key: SortKey::Name, descending: true },
+        );
+        assert_eq!(names(&items), ["Alpha", "gamma.txt", "beta.txt"]);
+    }
+
+    /// 按大小排序时同值用名称兜底，结果可预期（不依赖原始顺序）。
+    #[test]
+    fn sort_size_falls_back_to_name() {
+        let mut items = vec![
+            e("b.dat", EntryKind::File, 100, 0),
+            e("a.dat", EntryKind::File, 100, 0),
+            e("c.dat", EntryKind::File, 300, 0),
+        ];
+        sort_entries(
+            &mut items,
+            &Sort { key: SortKey::Size, descending: false },
+        );
+        assert_eq!(names(&items), ["a.dat", "b.dat", "c.dat"]);
+    }
+
+    /// 按修改时间排序（值越大越新）。
+    #[test]
+    fn sort_modified() {
+        let mut items = vec![
+            e("old.txt", EntryKind::File, 0, 1),
+            e("new.txt", EntryKind::File, 0, 9),
+        ];
+        sort_entries(
+            &mut items,
+            &Sort { key: SortKey::Modified, descending: false },
+        );
+        assert_eq!(names(&items), ["old.txt", "new.txt"]);
+    }
+
+    /// 单元素与空表直接返回，不 panic。
+    #[test]
+    fn sort_handles_tiny_input() {
+        let mut one = vec![e("only.txt", EntryKind::File, 0, 0)];
+        sort_entries(&mut one, &Sort::default());
+        assert_eq!(names(&one), ["only.txt"]);
+
+        let mut none: Vec<Entry> = Vec::new();
+        sort_entries(&mut none, &Sort::default());
+        assert!(none.is_empty());
+    }
 }

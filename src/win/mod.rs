@@ -26,6 +26,37 @@ pub fn to_wide_raw(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
+/// 路径 → NUL 结尾宽串，必要时加上 `\\?\` 前缀以突破 MAX_PATH。
+///
+/// `\\?\` 会关掉系统对路径的规范化，所以只在确实有必要时加：
+/// 已经带前缀、含 `..` 这类需要规范化的成分、或本身不长，都原样返回。
+/// 调用方拿到的是普通路径时，行为与 `to_wide` 完全一致。
+pub fn to_wide_path(p: &std::path::Path) -> Vec<u16> {
+    let s = p.to_string_lossy();
+    if s.starts_with(r"\\?\") || s.starts_with(r"\\.\") {
+        return to_wide(&s);
+    }
+    // 按 UTF-16 码元计长（`\\?\` 的判定就是看码元数），并留出追加文件名的余量
+    let units: usize = s.chars().map(|c| c.len_utf16()).sum();
+    let needs_prefix = units >= 248
+        && !p
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if !needs_prefix {
+        return to_wide(&s);
+    }
+    let normalized = s.replace('/', "\\");
+    match normalized.strip_prefix(r"\\") {
+        // UNC：\\server\share → \\?\UNC\server\share
+        Some(rest) => to_wide(&format!(r"\\?\UNC\{rest}")),
+        None if normalized.len() >= 3 && normalized.as_bytes()[1] == b':' => {
+            to_wide(&format!(r"\\?\{normalized}"))
+        }
+        // 相对路径等：加了前缀反而更糟，交给系统自己处理
+        None => to_wide(&s),
+    }
+}
+
 /// 从定长 UTF-16 缓冲（NUL 结尾）转回 String。
 pub fn from_wide(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());

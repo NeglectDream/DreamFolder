@@ -3,7 +3,7 @@
 //! 因为整个界面是自绘的，所有热区都由 `hit_test` 计算。
 //! 命中优先级从「最上层、最小」到「最下层、最大」排列。
 
-use crate::app::{Application, SearchMode};
+use crate::app::Application;
 use crate::win::paint::rect_contains;
 
 use super::{navpane, scrollbar_geom, winbtn, Hit, ScrollBar, ScrollDrag, ScrollPane};
@@ -20,6 +20,19 @@ pub fn hit_test(app: &Application, x: i32, y: i32) -> Hit {
     }
 
     let l = &app.layout;
+
+    // ---- 地址栏历史下拉（浮层，压在所有区域之上）----
+    if app.addr_suggest_open() {
+        let pane = app.addr_suggest_pane_rect();
+        if rect_contains(pane, x, y) {
+            for i in 0..app.addr_suggest.len() {
+                if rect_contains(app.addr_suggest_item_rect(i), x, y) {
+                    return Hit::AddrSuggest(i);
+                }
+            }
+            return Hit::AddrSuggestPane;
+        }
+    }
 
     // ---- 窗口按钮（最上层）----
     let wb = l.window_buttons;
@@ -197,13 +210,13 @@ pub fn hit_test(app: &Application, x: i32, y: i32) -> Hit {
                 return Hit::DetailButton(i);
             }
         }
-        // 标签模块：只有「添加」和每行右端的叉是可点的，行本身不响应
-        let tags = super::detailtags::compute(app);
-        if rect_contains(tags.add, x, y) {
+        // 标签模块：只有「添加」chip 和每个 chip 右端的叉是可点的
+        let sec = super::detailtags::sections(app);
+        if rect_contains(sec.tags.add, x, y) {
             return Hit::DetailTagAdd;
         }
-        for (i, r) in tags.rows.iter().enumerate() {
-            if rect_contains(r.close, x, y) {
+        for (i, c) in sec.tags.chips.iter().enumerate() {
+            if rect_contains(c.close, x, y) {
                 return Hit::DetailTagClose(i);
             }
         }
@@ -937,6 +950,10 @@ pub fn on_lbutton_up(app: &mut Application, x: i32, y: i32) {
         Hit::Refresh => app.refresh_active_tab(),
         Hit::Address => app.begin_address_edit_at(x),
         Hit::Search => app.focus_search(),
+        // 点历史下拉里的某一条＝直接跳过去
+        Hit::AddrSuggest(i) => app.accept_addr_suggest(i),
+        // 点浮层的空白处：吃掉，不要让点击穿到下面的工具条
+        Hit::AddrSuggestPane => {}
         Hit::FavoriteItem(i) => {
             // 长按拖动过：松手时只做排序，不再当成一次点击
             if app.fav_drag.is_none() {
@@ -972,9 +989,9 @@ pub fn on_lbutton_up(app: &mut Application, x: i32, y: i32) {
         Hit::DetailTagAdd => detail_tag_add_menu(app, x, y),
         // 行右端的叉：把这一项从这个标签里摘掉（不动磁盘上的文件）
         Hit::DetailTagClose(i) => {
-            let rows = super::detailtags::compute(app);
-            if let Some(r) = rows.rows.get(i) {
-                let tag = r.tag;
+            let sec = super::detailtags::sections(app);
+            if let Some(c) = sec.tags.chips.get(i) {
+                let tag = c.tag;
                 app.tag_unassign_target(tag);
             }
         }
@@ -1107,7 +1124,7 @@ fn detail_button_action(app: &mut Application, button: usize) {
             let clean = crate::fs::strip_verbatim(&entry.full);
             let text = clean.to_string_lossy().into_owned();
             if crate::fs::shell::set_clipboard_text(&text) {
-                app.show_message("已复制路径");
+                app.show_status_note("已复制路径");
             } else {
                 app.show_message("复制失败：剪贴板被占用");
             }
@@ -1918,6 +1935,14 @@ pub fn on_key_down(app: &mut Application, vk_raw: usize) -> bool {
         return on_edit_key(app, vk);
     }
 
+    // 空格＝快速预览（受设置开关控制，见 `enable_quickpreview`）。
+    // 必须排在 type-ahead 之前：空格的 ToUnicode 就是一个空格字符，
+    // 否则它会被当成「打字定位」吃掉。
+    if vk == VK_SPACE && !app.modifiers.ctrl && !app.modifiers.alt {
+        app.quick_preview_selection();
+        return true;
+    }
+
     // 快捷键在设置里被禁用时只保留基础导航键
     let hotkeys_on = !app.cfg.settings.disable_all_hotkeys;
 
@@ -1950,6 +1975,11 @@ pub fn on_key_down(app: &mut Application, vk_raw: usize) -> bool {
         true
     }
         // ---- 基础导航（不受快捷键开关影响）----
+        VK_ESCAPE => {
+            // 拖动分组分隔线中途按 Esc＝放弃这次拖动（和资源管理器一致）
+            app.nav_sep_cancel();
+            true
+        }
         VK_BACK => {
             app.go_up();
             true
@@ -2103,6 +2133,27 @@ fn on_edit_key(app: &mut Application, vk: u16) -> bool {
             }
             true
         }
+        VK_DOWN => {
+            // 地址栏编辑时方向键先在历史下拉里走，走不动才交回文本编辑
+            if app.address_editing && app.addr_suggest_move(true) {
+                return true;
+            }
+            if app.address_editing || app.rename_active() {
+                return false;
+            }
+            app.move_selection(1);
+            true
+        }
+        VK_UP => {
+            if app.address_editing && app.addr_suggest_move(false) {
+                return true;
+            }
+            if app.address_editing || app.rename_active() {
+                return false;
+            }
+            app.move_selection(-1);
+            true
+        }
         VK_DELETE => {
             app.edit_delete();
             true
@@ -2216,16 +2267,6 @@ pub fn scroll_into_view(app: &mut Application, index: usize) {
     } else if item_top_rel + item_h > view_h {
         app.tabs[active].scroll_y += item_top_rel + item_h - view_h;
     }
-}
-
-/// 搜索模式循环切换。
-pub fn cycle_search_mode(app: &mut Application) {
-    app.search_mode = match app.search_mode {
-        SearchMode::Quick => SearchMode::System,
-        SearchMode::System => SearchMode::Web,
-        SearchMode::Web => SearchMode::Quick,
-    };
-    app.request_repaint();
 }
 
 /// `WM_KEYDOWN` 的 vk → 真实字符。

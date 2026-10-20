@@ -38,14 +38,10 @@ pub mod metrics {
     /// 状态栏高度，对齐原生 `STATUSCLASSNAME` 的 24。
     pub const STATUSBAR_H: i32 = 24;
 
-    /// 右侧详细信息窗格的宽度（逻辑值）。
-    pub const DETAIL_PANE_W: i32 = 280;
-
     pub const TAB_MIN_W: i32 = 64;
     pub const TAB_MAX_W: i32 = 200;
     /// 「新建标签」按钮宽度（逻辑值）。
     pub const NEW_TAB_W: i32 = 22;
-    pub const TAB_PADDING: i32 = 12;
 
     /// 窗口按钮（菜单/最小化/最大化/关闭）的单个宽度。
     ///
@@ -58,9 +54,6 @@ pub mod metrics {
     /// 所以分配空间时它优先于搜索框。
     pub const ADDR_MIN_W: i32 = 320;
     pub const SEARCH_W: i32 = 200;
-
-    /// 左侧导航窗格宽度。资源管理器在 100% DPI 下约 280。
-    pub const NAV_PANE_W: i32 = 280;
 
     /// 导航窗格中一行的高度（含图标与文字）。
     pub const NAV_ROW_H: i32 = 28;
@@ -667,11 +660,6 @@ impl Layout {
             self.titlebar.bottom - s(4),
         )
     }
-
-    /// 视图中一行/一格是否可见（虚拟化绘制用）。
-    pub fn view_visible_height(&self) -> i32 {
-        (self.view.bottom - self.view.top).max(0)
-    }
 }
 
 /// 命中测试结果。
@@ -709,6 +697,10 @@ pub enum Hit {
     DetailTagAdd,
     /// 详情窗格标签模块的第 N 行右端那个叉（把这一项从该标签移除）。
     DetailTagClose(usize),
+    /// 地址栏历史下拉里的第 N 条建议（点击＝跳到该路径）。
+    AddrSuggest(usize),
+    /// 地址栏历史下拉的浮层本身（吃掉点击，别穿透到下面的视图）。
+    AddrSuggestPane,
     Statusbar,
     /// 导航窗格里的第 N 行（点击＝跳转到该位置）。
     NavItem(usize),
@@ -754,9 +746,8 @@ pub struct ScrollBar {
     pub thumb: RECT,
     /// 鼠标命中区：比细线宽一圈，否则一两个像素宽的东西根本按不住。
     pub hit: RECT,
-    /// 轨道的上下端。
+    /// 轨道的上端。
     pub track_top: i32,
-    pub track_bottom: i32,
     /// 滑块高度与可移动距离（拖动时按比例换算滚动量）。
     pub thumb_h: i32,
     pub travel: i32,
@@ -827,7 +818,6 @@ pub fn scrollbar_geom(
         thumb,
         hit,
         track_top: vr.top,
-        track_bottom: vr.bottom,
         thumb_h,
         travel,
         max_scroll,
