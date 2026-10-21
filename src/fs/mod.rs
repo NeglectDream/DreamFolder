@@ -7,7 +7,10 @@ pub mod ops;
 pub mod recycle;
 pub mod search;
 pub mod shell;
+pub mod sortkey;
 pub mod thumbs;
+pub mod typename;
+pub mod watch;
 
 /// 只 re-export 外部真正会用到的两个类型：
 /// `Sort`/`SortKey` 同时服务于枚举层与设置持久化层（见 `cfg::settings`）。
@@ -15,8 +18,77 @@ pub use enumerate::{Sort, SortKey};
 
 use std::path::{Path, PathBuf};
 
-/// 把用户输入解析成绝对路径。
+/// 是不是一个网址（地址栏里粘贴网址应当交给浏览器，而不是当成路径）。
+pub fn looks_like_url(input: &str) -> bool {
+    let l = input.trim().to_ascii_lowercase();
+    l.starts_with("http://")
+        || l.starts_with("https://")
+        || l.starts_with("ftp://")
+        || l.starts_with("www.")
+}
+
+/// 补全裸域名的协议前缀（`www.example.com` → `https://www.example.com`）。
+pub fn normalize_url(input: &str) -> String {
+    let t = input.trim();
+    if t.to_ascii_lowercase().starts_with("www.") {
+        format!("https://{t}")
+    } else {
+        t.to_string()
+    }
+}
+
+/// 把 `shell:` 别名换算成真实目录。
 ///
+/// 资源管理器的地址栏接受 `shell:startup` 这类命名空间写法。我们整套导航
+/// 建立在真实路径上（枚举、标签、历史都按目录走），所以这里把最常用的别名
+/// 映射到它们背后的文件夹；不认识的返回 `None`，由调用方给出提示。
+pub fn resolve_shell_alias(input: &str) -> Option<PathBuf> {
+    let lower = input.trim().to_ascii_lowercase();
+    let key: String = lower
+        .strip_prefix("shell:")?
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    // 桌面、文档、图片这些一律问 Shell，不要拼 `%USERPROFILE%\Desktop`：
+    // OneDrive 接管或组策略重定向之后，拼出来的是个不存在的空目录，
+    // 地址栏跳过去就是「无法访问该位置」。
+    let known = match key.as_str() {
+        "desktop" | "desktopdirectory" => Some(crate::fs::shell::KnownFolder::Desktop),
+        "personal" | "documents" | "mydocuments" => Some(crate::fs::shell::KnownFolder::Documents),
+        "downloads" => Some(crate::fs::shell::KnownFolder::Downloads),
+        "pictures" | "mypictures" => Some(crate::fs::shell::KnownFolder::Pictures),
+        "music" | "mymusic" => Some(crate::fs::shell::KnownFolder::Music),
+        "videos" | "myvideos" => Some(crate::fs::shell::KnownFolder::Videos),
+        "profile" | "userprofile" => Some(crate::fs::shell::KnownFolder::Profile),
+        _ => None,
+    };
+    if let Some(k) = known {
+        return crate::fs::shell::known_folder(k);
+    }
+
+    let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
+    let p = match key.as_str() {
+        "startup" => env("APPDATA").map(|d| d.join(r"Microsoft\Windows\Start Menu\Programs\Startup")),
+        "commonstartup" => env("ProgramData")
+            .map(|d| d.join(r"Microsoft\Windows\Start Menu\Programs\Startup")),
+        "appdata" | "roaming" => env("APPDATA"),
+        "localappdata" => env("LOCALAPPDATA"),
+        "programs" => env("APPDATA").map(|d| d.join(r"Microsoft\Windows\Start Menu\Programs")),
+        "commonprograms" => {
+            env("ProgramData").map(|d| d.join(r"Microsoft\Windows\Start Menu\Programs"))
+        }
+        "temp" | "mytemporary" => env("TEMP"),
+        "windows" => env("SystemRoot"),
+        "system" | "system32" => env("SystemRoot").map(|d| d.join("System32")),
+        "fonts" => env("SystemRoot").map(|d| d.join("Fonts")),
+        "public" => env("PUBLIC"),
+        _ => None,
+    };
+    p.filter(|p| p.is_dir())
+}
+
+/// 把用户输入解析成绝对路径。///
 /// 支持：
 ///   - 普通绝对/相对路径
 ///   - `~` → 用户主目录

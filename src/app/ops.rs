@@ -42,7 +42,37 @@ impl Application {
         };
         self.cfg.settings.sort_key = key;
         self.cfg.settings.sort_desc = self.tabs[idx].sort.descending;
-        self.reload_active_tab();
+        self.remember_folder_view();
+
+        // 原地重排，不重新枚举：切列只是换一个比较键，磁盘内容一点没变。
+        // 重新扫盘会让大目录肉眼可见地卡一下，而资源管理器是瞬间完成的。
+        let keep: std::collections::HashSet<PathBuf> =
+            self.selected_paths().into_iter().collect();
+        {
+            let Some(t) = self.tabs.get_mut(idx) else {
+                return;
+            };
+            let sort = t.sort;
+            crate::fs::enumerate::sort_entries(&mut t.entries, &sort);
+
+            // 重排后按下标记的选中/锚点全部失效，按路径找回
+            t.selected.clear();
+            t.anchor = None;
+            t.focus = None;
+            if !keep.is_empty() {
+                for (i, e) in t.entries.iter().enumerate() {
+                    if keep.contains(&e.full) {
+                        t.selected.insert(i);
+                        if t.anchor.is_none() {
+                            t.anchor = Some(i);
+                        }
+                        if t.focus.is_none() {
+                            t.focus = Some(i);
+                        }
+                    }
+                }
+            }
+        }
         self.request_repaint();
     }
 
@@ -69,6 +99,81 @@ impl Application {
             items: paths,
             permanent,
         });
+    }
+
+    /// 回收站里把选中项还原到删除前的位置。
+    ///
+    /// 目标处已有同名文件时自动改名（见 `recycle::restore`），不会覆盖。
+    /// 一件都没成功时把最后一条错误留在状态栏，避免"点了没反应"。
+    pub fn restore_recycle_selection(&mut self) {
+        if !self.in_recycle_bin() {
+            return;
+        }
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let mut ok = 0usize;
+        let mut err: Option<String> = None;
+        let mut last_target: Option<PathBuf> = None;
+        for p in &paths {
+            match crate::fs::recycle::restore(p) {
+                Ok(t) => {
+                    ok += 1;
+                    last_target = Some(t);
+                }
+                Err(e) => err = Some(e),
+            }
+        }
+        if ok == 0 {
+            if let Some(e) = err {
+                self.show_message(&e);
+            }
+            return;
+        }
+        let note = if ok == 1 {
+            match last_target {
+                Some(t) => format!("已还原到 {}", t.display()),
+                None => "已还原".to_string(),
+            }
+        } else {
+            format!("已还原 {ok} 项")
+        };
+        self.show_status_note(&note);
+        self.refresh_active_tab();
+    }
+
+    /// Shift+Delete：永久删除，先问一次。
+    ///
+    /// 资源管理器的这条路径会弹「确实要永久删除吗」，我们没有理由不问——
+    /// 它绕过了回收站，是唯一一个按下去就真的找不回来的操作。
+    /// 在回收站里按 Shift+Delete 只是加快彻底删除，不再重复问一遍。
+    pub fn confirm_delete_permanent(&mut self) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        if self.in_recycle_bin() {
+            self.delete_selection(true);
+            return;
+        }
+        let body = if paths.len() == 1 {
+            let name = paths[0]
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| paths[0].to_string_lossy().into_owned());
+            format!("确实要永久删除“{name}”吗？此操作无法撤销。")
+        } else {
+            format!(
+                "确实要永久删除这 {} 项吗？此操作无法撤销。",
+                paths.len()
+            )
+        };
+        self.dialog_confirm(
+            "永久删除",
+            &body,
+            crate::ui::dialog::DialogIntent::DeletePermanent { items: paths },
+        );
     }
 
     /// 把一次耗时不可控的文件操作丢给后台线程。
@@ -108,7 +213,12 @@ impl Application {
     }
 
     pub fn paste_into_active_tab(&mut self) {
-        let sources = shell::get_clipboard_files();
+        // 外部程序写进剪贴板的路径可能带 `\\?\` 前缀，而 Shell 那一侧
+        // 不认（`SHFileOperation` 会回「路径无效」）；统一剥掉再走。
+        let sources: Vec<PathBuf> = shell::get_clipboard_files()
+            .into_iter()
+            .map(|p| crate::fs::strip_verbatim(&p))
+            .collect();
         if sources.is_empty() {
             return;
         }
@@ -116,6 +226,15 @@ impl Application {
             return;
         };
         if target.as_os_str().is_empty() {
+            return;
+        }
+
+        // 剪贴板里可能是别的程序留下的旧内容，源早就挪走了。直接交给
+        // Shell 只会换回一句语焉不详的「操作失败（代码 0x2）」——
+        // 这里先看一眼，把到底哪条不见了说出来。
+        if let Some(gone) = sources.iter().find(|p| !p.exists()) {
+            let msg = format!("源已不存在：{}", gone.display());
+            self.show_message(&msg);
             return;
         }
 
@@ -145,7 +264,15 @@ impl Application {
         self.address_editing = false;
         self.search_focused = false;
         self.inline_edit_text = name.clone();
-        self.inline_edit_caret = name.chars().count();
+        // 只选中主干、扩展名保持不选——资源管理器就是这样：直接打字是改名字，
+        // 想改扩展名再按 End。以前全选整个文件名，顺手敲一个字符就把
+        // `.docx` 一起替换掉了，改完文件类型都变了。
+        let stem_len = match name.rfind('.') {
+            Some(pos) if pos > 0 && pos + 1 < name.len() => name[..pos].chars().count(),
+            _ => name.chars().count(),
+        };
+        self.inline_edit_caret = stem_len;
+        self.address_sel = Some((0, stem_len));
         self.request_repaint();
     }
 
@@ -192,6 +319,7 @@ impl Application {
             t.selected.clear();
             t.selected.insert(i);
             t.anchor = Some(i);
+            t.focus = Some(i);
         }
         self.fill_entry_meta(tab);
         self.request_repaint();
@@ -258,6 +386,7 @@ impl Application {
         let pos = all.iter().position(|&v| v == t.view_mode).unwrap_or(0);
         t.view_mode = all[(pos + 1) % all.len()];
         t.scroll_y = 0;
+        self.remember_folder_view();
         self.request_repaint();
     }
 
@@ -287,6 +416,7 @@ impl Application {
         t.view_mode = STEPS[next];
         t.scroll_y = 0;
         self.cfg.settings.view_mode = STEPS[next];
+        self.remember_folder_view();
         self.request_repaint();
     }
 
@@ -296,6 +426,7 @@ impl Application {
             t.scroll_y = 0;
         }
         self.cfg.settings.view_mode = mode;
+        self.remember_folder_view();
         self.request_repaint();
     }
 }

@@ -195,6 +195,7 @@ pub fn list_dir(dir: &Path, opts: &ListOptions) -> Result<Listing, String> {
                     icon_key,
                     // 容量只对驱动器有意义，普通枚举不查盘
                     volume: None,
+                    origin: None,
                 });
             }
         }
@@ -240,6 +241,7 @@ pub fn list_computer(opts: &ListOptions) -> Listing {
             type_name: "本地磁盘".to_string(),
             icon_key: IconKey::Drive,
             volume: None,
+            origin: None,
         });
     }
     // 「此电脑」固定按盘符字母顺序排，不跟随列表当前的排序方式——
@@ -311,53 +313,71 @@ pub fn drive_label(drive: &Path) -> String {
     }
 }
 
-/// 排序：目录恒在文件之前，随后按选定键比较。
+/// 排序：完整复刻资源管理器的四列语义（名称 / 大小 / 类型 / 修改日期）。
+///
+/// 名称列不是字典序，而是 `StrCmpLogicalW` 的自然排序——数字按数值、
+/// 中文按拼音、忽略大小写。详见 `fs::sortkey`。
+/// 目录恒在文件之前，四列都是（降序也不翻转），见下方比较函数里的说明。
 ///
 /// 比较用的 key 一律**先算一遍再排**：如果放在比较函数里现算，
-/// `to_lowercase()` / `ext()` 会被调用几十万次（1 万条目 ≈ 13 万次比较，
-/// 每次 2 个 String 分配），打开大目录时这部分比枚举本身还贵。
+/// UTF-16 转换 / `ext()` / 类型名查询会被调用几十万次（1 万条目 ≈ 13 万次
+/// 比较，每次 2 次分配），打开大目录时这部分比枚举本身还贵。
 pub fn sort_entries(entries: &mut [Entry], sort: &Sort) {
+    use crate::fs::sortkey::{natural_cmp, natural_key};
     use std::cmp::Ordering;
 
     let n = entries.len();
     if n < 2 {
         return;
     }
-    let names: Vec<String> = entries.iter().map(|e| e.sort_name_key()).collect();
-    let kinds: Vec<String> = match sort.key {
-        SortKey::Kind => entries.iter().map(|e| e.ext()).collect(),
+    let names: Vec<Vec<u16>> = entries.iter().map(|e| e.sort_name_key()).collect();
+    // 「类型」排序必须按用户看到的那串文字比（「文本文档」「位图图像」），
+    // 而不是按扩展名字母序：扩展名序会把「png」和「txt」的先后强加给两个
+    // 中文类型名，屏幕上就成了看不懂的顺序。同名共享一份全局缓存。
+    let kinds: Vec<Vec<u16>> = match sort.key {
+        SortKey::Kind => entries
+            .iter()
+            .map(|e| {
+                if e.is_dir() {
+                    natural_key(crate::fs::typename::folder())
+                } else {
+                    natural_key(&crate::fs::typename::for_ext(&e.ext()))
+                }
+            })
+            .collect(),
         _ => Vec::new(),
     };
 
     let src: &[Entry] = entries;
-    let dir_ord = |a: &Entry, b: &Entry| -> Ordering {
-        match (a.is_dir(), b.is_dir()) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => Ordering::Equal,
-        }
-    };
 
-    // 先排下标，最后按置换把条目就位：比较时不碰条目本身，借用冲突最小
+    // 先排下标，最后按置换把条目就位：比较时不碰条目本身，借用冲突最小。
+    //
+    // 目录恒在文件之前：Windows 资源管理器的详情视图里「类型」列排在最前的
+    // 永远是文件夹，列表也把目录归在最上——这是用户读目录的第一直觉。
+    // 降序时目录同样留在最上面（只把文件倒过来），否则点一下「降序」
+    // 整屏目录瞬间沉底，反而更难找。
     let mut idx: Vec<u32> = (0..n as u32).collect();
     idx.sort_by(|&a, &b| {
         let (ia, ib) = (a as usize, b as usize);
-        // 目录优先，且不受「降序」影响（资源管理器行为）
-        let dir = dir_ord(&src[ia], &src[ib]);
+        let dir = match (src[ia].is_dir(), src[ib].is_dir()) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => Ordering::Equal,
+        };
         if dir != Ordering::Equal {
             return dir;
         }
         let ord = match sort.key {
-            SortKey::Name => names[ia].cmp(&names[ib]),
+            SortKey::Name => natural_cmp(&names[ia], &names[ib]),
             SortKey::Size => src[ia].size.cmp(&src[ib].size),
-            SortKey::Kind => kinds[ia]
-                .cmp(&kinds[ib])
-                .then_with(|| names[ia].cmp(&names[ib])),
+            SortKey::Kind => {
+                natural_cmp(&kinds[ia], &kinds[ib]).then_with(|| natural_cmp(&names[ia], &names[ib]))
+            }
             SortKey::Modified => src[ia].modified.cmp(&src[ib].modified),
         };
         // 同值时用名称兜底，保证稳定可预期
         let ord = if ord == Ordering::Equal && sort.key != SortKey::Name {
-            names[ia].cmp(&names[ib])
+            natural_cmp(&names[ia], &names[ib])
         } else {
             ord
         };
@@ -368,12 +388,22 @@ pub fn sort_entries(entries: &mut [Entry], sort: &Sort) {
         }
     });
 
-    // 按下标置换把条目换到目标位置（每个元素最多换一次）
+    // 把排序结果搬回原切片。
+    //
+    // `idx[k]` 是「排序后第 k 位应当装入的原始下标」。直接在切片上做
+    // `swap(i, idx[i])` 是错的：一次交换之后 `idx` 的语义就变了，
+    // 只有自逆置换（全是 2-循环）碰巧正确，3 个及以上元素的循环会被打乱——
+    // 例如 `[b, c, a]` 这种最常见的轮换，会排成 `[c, a, b]`。
+    // 正确做法是先转成逆置换 `pos[orig] = 目标位置`，再逐位把元素换过去。
+    let mut pos = vec![0u32; n];
+    for (k, &orig) in idx.iter().enumerate() {
+        pos[orig as usize] = k as u32;
+    }
     for i in 0..n {
-        while idx[i] as usize != i {
-            let j = idx[i] as usize;
+        while pos[i] as usize != i {
+            let j = pos[i] as usize;
             entries.swap(i, j);
-            idx.swap(i, j);
+            pos.swap(i, j);
         }
     }
 }
@@ -418,6 +448,7 @@ pub fn entry_from_path(path: &Path) -> Option<Entry> {
         type_name: String::new(),
         icon_key,
         volume: None,
+        origin: None,
     })
 }
 
@@ -489,6 +520,7 @@ mod tests {
             type_name: String::new(),
             icon_key: IconKey::Pending,
             volume: None,
+            origin: None,
         }
     }
 
@@ -496,9 +528,9 @@ mod tests {
         entries.iter().map(|e| e.name.as_str()).collect()
     }
 
-    /// 名称排序不分大小写，且目录永远在前（即使按降序）。
+    /// 名称排序复刻资源管理器：忽略大小写，目录恒在文件之前。
     #[test]
-    fn sort_name_is_case_insensitive_and_dirs_first() {
+    fn sort_name_keeps_dirs_first() {
         let mut items = vec![
             e("beta.txt", EntryKind::File, 0, 0),
             e("Alpha", EntryKind::Directory, 0, 0),
@@ -510,12 +542,72 @@ mod tests {
         );
         assert_eq!(names(&items), ["Alpha", "beta.txt", "gamma.txt"]);
 
-        // 降序：文件倒过来，目录仍在最前
+        // 降序：文件倒过来，目录仍留在最前
         sort_entries(
             &mut items,
             &Sort { key: SortKey::Name, descending: true },
         );
         assert_eq!(names(&items), ["Alpha", "gamma.txt", "beta.txt"]);
+    }
+
+    /// 目录置顶对四列都成立，包括「类型」列（文件夹永远是第一个类型）。
+    #[test]
+    fn dirs_first_for_every_sort_key() {
+        for key in [SortKey::Name, SortKey::Size, SortKey::Kind, SortKey::Modified] {
+            for descending in [false, true] {
+                let mut items = vec![
+                    e("a_file.txt", EntryKind::File, 999, 99),
+                    e("z_dir", EntryKind::Directory, 0, 0),
+                ];
+                sort_entries(&mut items, &Sort { key, descending });
+                assert_eq!(names(&items), ["z_dir", "a_file.txt"], "{key:?} desc={descending}");
+            }
+        }
+    }
+
+    /// 名字里的数字按数值排：`file2` 在 `file10` 之前（字典序恰好相反）。
+    #[test]
+    fn sort_name_orders_digits_numerically() {
+        let mut items = vec![
+            e("file10.txt", EntryKind::File, 0, 0),
+            e("file2.txt", EntryKind::File, 0, 0),
+            e("file1.txt", EntryKind::File, 0, 0),
+            e("File1.txt", EntryKind::File, 0, 0),
+        ];
+        sort_entries(
+            &mut items,
+            &Sort { key: SortKey::Name, descending: false },
+        );
+        let got = names(&items);
+        // 大小写等价：`File1.txt` / `file1.txt` 同档，一起排在 file2 之前
+        let head: Vec<&str> = got[..2].to_vec();
+        assert!(head.contains(&"file1.txt"), "{got:?}");
+        assert!(head.contains(&"File1.txt"), "{got:?}");
+        assert_eq!(got[2], "file2.txt");
+        assert_eq!(got[3], "file10.txt");
+    }
+
+    /// 「类型」排序把同类型的文件聚在一起，同类型内再按名称。
+    #[test]
+    fn sort_kind_groups_same_type_together() {
+        let mut items = vec![
+            e("a.txt", EntryKind::File, 0, 0),
+            e("b.png", EntryKind::File, 0, 0),
+            e("c.txt", EntryKind::File, 0, 0),
+            e("d.png", EntryKind::File, 0, 0),
+        ];
+        sort_entries(
+            &mut items,
+            &Sort { key: SortKey::Kind, descending: false },
+        );
+        let got = names(&items);
+        let pos = |n: &str| got.iter().position(|x| *x == n).unwrap() as i64;
+        // 同类相邻：两个 txt 挨着、两个 png 挨着（输入是交错的）
+        assert_eq!((pos("a.txt") - pos("c.txt")).abs(), 1, "{got:?}");
+        assert_eq!((pos("b.png") - pos("d.png")).abs(), 1, "{got:?}");
+        // 同一类型内仍是名称序
+        assert!(pos("a.txt") < pos("c.txt"), "{got:?}");
+        assert!(pos("b.png") < pos("d.png"), "{got:?}");
     }
 
     /// 按大小排序时同值用名称兜底，结果可预期（不依赖原始顺序）。
@@ -558,4 +650,5 @@ mod tests {
         sort_entries(&mut none, &Sort::default());
         assert!(none.is_empty());
     }
+
 }

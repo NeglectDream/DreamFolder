@@ -157,18 +157,24 @@ pub fn compute(app: &Application, y0: i32) -> TagsLayout {
     }
 }
 
-/// 排布详情窗格的两个内容模块（标签 / 文件明细）。
+/// 排布详情窗格的两个内容模块（文件明细 / 标签）。
 ///
-/// 顺序由设置 `detail_tags_first` 决定，默认标签在明细下面。
+/// 顺序由 `cfg.settings.detail_sections` 决定，用户按住两个模块之间的
+/// 分隔线上下拖即可换位（与导航窗格分组排序同款交互）。
 /// 分隔线的纵坐标也一并给出：按钮区下沿一条、两个模块之间一条。
 pub struct DetailSections {
+    /// 标签模块的几何（无论它排在上下都会算出来）。
     pub tags: TagsLayout,
     /// 文件明细第一行的 y。
     pub info_top: i32,
     /// 按钮区下方分隔线的 y。
     pub divider_buttons: i32,
-    /// 两个模块之间分隔线的 y。
+    /// 两个模块之间分隔线的 y（拖动把手）。
     pub divider_mid: i32,
+    /// 模块区的上沿（第一个模块从这里开始）。
+    pub content_top: i32,
+    /// 模块区的下沿（最后一个模块的下沿）。
+    pub content_bottom: i32,
 }
 
 pub fn sections(app: &Application) -> DetailSections {
@@ -176,24 +182,117 @@ pub fn sections(app: &Application) -> DetailSections {
     let row_h = s(metrics::DETAIL_ROW_H);
     let top = app.layout.detail_buttons_bottom() + s(14);
     let divider_buttons = top - s(8);
+    let info_h = INFO_ROWS * row_h;
 
-    if app.cfg.settings.detail_tags_first {
+    // sanitize 保证顺序里恰好两个模块，取第一项判断谁在上面即可
+    let tags_first = app.cfg.settings.detail_sections.first()
+        == Some(&crate::cfg::settings::DetailSection::Tags);
+
+    if tags_first {
         let tags = compute(app, top);
         let info_top = tags.bottom + s(2);
         DetailSections {
             divider_mid: tags.bottom - s(7),
+            content_top: top,
+            content_bottom: info_top + info_h,
             tags,
             info_top,
             divider_buttons,
         }
     } else {
         let info_top = top;
-        let tags = compute(app, top + INFO_ROWS * row_h + s(10));
+        let tags = compute(app, top + info_h + s(10));
         DetailSections {
             divider_mid: tags.label.top - s(7),
+            content_top: top,
+            content_bottom: tags.bottom,
             tags,
             info_top,
             divider_buttons,
         }
+    }
+}
+
+/// 模块区中线：拖动落点在它上方算「插到最前」。
+fn mid_y(sec: &DetailSections) -> i32 {
+    (sec.content_top + sec.content_bottom) / 2
+}
+
+/// 当前指针位置对应的目标槽位（按摘掉被拖模块后的列表计）。
+pub fn insertion_slot(sec: &DetailSections, y: i32) -> usize {
+    if y < mid_y(sec) {
+        0
+    } else {
+        1
+    }
+}
+
+/// 目标槽位对应的插入指示线 y。
+pub fn insertion_y(sec: &DetailSections, slot: usize) -> i32 {
+    if slot == 0 {
+        sec.content_top
+    } else {
+        sec.content_bottom
+    }
+}
+
+/// 按目标槽位重排，返回新的顺序（与 `navpane::reorder` 同构）。
+pub fn reorder(
+    order: &[crate::cfg::settings::DetailSection],
+    drag: crate::cfg::settings::DetailSection,
+    slot: usize,
+) -> Vec<crate::cfg::settings::DetailSection> {
+    let mut v: Vec<_> = order.iter().copied().filter(|s| *s != drag).collect();
+    let at = slot.min(v.len());
+    v.insert(at, drag);
+    v
+}
+
+/// 正在进行的分割线拖动。
+///
+/// `module` 是被拖走的那个模块（按下时记录），`slot` 是目标位置。
+pub struct DetailSepDrag {
+    pub module: crate::cfg::settings::DetailSection,
+    pub slot: usize,
+}
+
+impl DetailSepDrag {
+    /// 这次拖动会不会真的改变顺序。
+    pub fn changed(&self, order: &[crate::cfg::settings::DetailSection]) -> bool {
+        !reorder(order, self.module, self.slot)
+            .iter()
+            .eq(order.iter())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cfg::settings::DetailSection;
+
+    /// 拖下面的模块到上半区（slot 0）＝换位；回到原位（slot 1）＝原序。
+    #[test]
+    fn reorder_swaps_and_restores() {
+        let order = [DetailSection::Info, DetailSection::Tags];
+        let swapped = reorder(&order, DetailSection::Tags, 0);
+        assert_eq!(swapped, [DetailSection::Tags, DetailSection::Info]);
+        let restored = reorder(&order, DetailSection::Tags, 1);
+        assert_eq!(restored, order);
+    }
+
+    /// `changed` 只看结果是否不同：落到原位不算改动。
+    #[test]
+    fn changed_detects_real_moves_only() {
+        let order = [DetailSection::Info, DetailSection::Tags];
+        let at_origin = DetailSepDrag {
+            module: DetailSection::Tags,
+            slot: 1,
+        };
+        assert!(!at_origin.changed(&order));
+        let to_top = DetailSepDrag {
+            module: DetailSection::Tags,
+            slot: 0,
+        };
+        assert!(to_top.changed(&order));
     }
 }

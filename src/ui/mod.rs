@@ -714,6 +714,9 @@ pub enum Hit {
     NavSplitter,
     /// 右侧详细信息窗格左边界的分隔条（左右拖动改宽度）。
     DetailSplitter,
+    /// 详情窗格内容模块之间的分隔线：按住上下拖可以调整模块顺序。
+    /// 0 = 上面那个模块（与 `cfg.settings.detail_sections` 的下标对应）。
+    DetailSeparator(usize),
     /// 状态栏右侧的视图切换按钮：0 = 详细列表，1 = 大图标。
     ViewToggle(usize),
     /// 设置面板里第 N 项（索引见 `settingspane::ITEMS`）。

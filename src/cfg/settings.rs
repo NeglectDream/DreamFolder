@@ -4,6 +4,76 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::fs::enumerate::Sort;
+
+/// 一个文件夹记住的视图与排序。
+///
+/// 资源管理器是按文件夹记忆的：在某个目录设了「详细信息 + 按修改时间」，
+/// 进出别的目录不会把这份设置带走。这里以前只有全局一份，每进一个新目录
+/// 都要重设一遍视图，是日常使用中最磨人的地方。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderView {
+    /// 目录绝对路径，统一存小写（Windows 路径大小写不敏感）。
+    pub path: String,
+    pub view: ViewMode,
+    pub sort_key: SortKey,
+    pub sort_desc: bool,
+}
+
+/// 最多记住多少个目录；超出后丢掉最早的一条（顺序即最近使用顺序）。
+pub const FOLDER_VIEW_MAX: usize = 200;
+
+/// 查某个目录记住的视图设置。
+pub fn lookup_folder_view<'a>(list: &'a [FolderView], path: &Path) -> Option<&'a FolderView> {
+    let key = path.to_string_lossy().to_lowercase();
+    list.iter().find(|v| v.path == key)
+}
+
+/// 记住（或更新）某个目录的视图设置。
+pub fn remember_folder_view(list: &mut Vec<FolderView>, path: &Path, view: ViewMode, sort: Sort) {
+    let key = path.to_string_lossy().to_lowercase();
+    if key.is_empty() {
+        return;
+    }
+    if let Some(pos) = list.iter().position(|v| v.path == key) {
+        let mut v = list.remove(pos);
+        v.view = view;
+        v.sort_key = sort.key;
+        v.sort_desc = sort.descending;
+        // 移到末尾＝最近使用，淘汰时先从最旧的开始
+        list.push(v);
+        return;
+    }
+    list.push(FolderView {
+        path: key,
+        view,
+        sort_key: sort.key,
+        sort_desc: sort.descending,
+    });
+    if list.len() > FOLDER_VIEW_MAX {
+        list.remove(0);
+    }
+}
+
+/// 读配置时的清洗：去重、丢掉非法项、裁剪到上限。
+pub fn sanitize_folder_views(list: Vec<FolderView>) -> Vec<FolderView> {
+    let mut out: Vec<FolderView> = Vec::with_capacity(list.len().min(FOLDER_VIEW_MAX));
+    for v in list {
+        if v.path.is_empty() {
+            continue;
+        }
+        if out.iter().any(|x| x.path == v.path) {
+            continue;
+        }
+        out.push(v);
+    }
+    if out.len() > FOLDER_VIEW_MAX {
+        let drop = out.len() - FOLDER_VIEW_MAX;
+        out.drain(0..drop);
+    }
+    out
+}
+
 /// 启动行为（对应 `start_*` 三个单选项）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -183,6 +253,28 @@ fn default_nav_sections() -> Vec<NavSection> {
     NavSection::default_order()
 }
 
+/// 右侧详情窗格的内容模块。预览框和按钮区是结构性部件，不参与排序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetailSection {
+    /// 文件明细（大小 / 修改时间 / 类型……六行）。
+    Info,
+    /// 标签归属（chips + 添加）。
+    Tags,
+}
+
+impl DetailSection {
+    pub const ALL: [DetailSection; 2] = [DetailSection::Info, DetailSection::Tags];
+
+    pub fn default_order() -> Vec<DetailSection> {
+        DetailSection::ALL.to_vec()
+    }
+}
+
+/// `serde` 默认值入口。
+fn default_detail_sections() -> Vec<DetailSection> {
+    DetailSection::default_order()
+}
+
 /// 三列默认宽度（修改日期 / 类型 / 大小）。
 ///
 /// 0 表示「自动」：布局按内容宽度的比例弹性等宽，用户拖过之后才写死像素。
@@ -226,17 +318,13 @@ pub struct Settings {
     pub show_nav_pane: bool,
     pub show_preview_pane: bool,
     pub show_detail_pane: bool,
-    /// 右侧详情窗格里「标签」模块排在文件明细**上方**。
-    ///
-    /// 默认 false：先看文件信息，标签在下面（与资源管理器的顺序相反，
-    /// 但标签是次要信息，不该把六行明细挤下去）。
-    #[serde(default)]
-    pub detail_tags_first: bool,
     pub show_extension: bool,
     pub show_hidden: bool,
     pub view_mode: ViewMode,
     pub sort_key: SortKey,
     pub sort_desc: bool,
+    /// 各文件夹各自记住的视图与排序（见 [`FolderView`]）。
+    pub folder_views: Vec<FolderView>,
     pub theme: ThemeKind,
 
     /// 界面整体缩放，叠加在 DPI 之上。
@@ -276,6 +364,12 @@ pub struct Settings {
     /// [`Settings::load`] 会补齐去重，保证界面上永远五组俱全。
     #[serde(default = "default_nav_sections")]
     pub nav_sections: Vec<NavSection>,
+    /// 右侧详情窗格内容模块的先后顺序（见 [`DetailSection`]）。
+    ///
+    /// 分隔线就是拖动把手（与导航窗格同款交互），拖一下即改即存。
+    /// 老配置里没有这一项：读出来落回默认顺序。
+    #[serde(default = "default_detail_sections")]
+    pub detail_sections: Vec<DetailSection>,
 
     // ---- 窗口几何 ----
     /// `i32::MIN` 表示「未保存过」，启动时居中。
@@ -323,17 +417,18 @@ impl Default for Settings {
             show_preview_pane: false,
             // 新窗格默认开着：需求就是要它常驻在右侧
             show_detail_pane: true,
-            detail_tags_first: false,
             show_extension: true,
             show_hidden: false,
             view_mode: ViewMode::Medium,
             sort_key: SortKey::Name,
             sort_desc: false,
+            folder_views: Vec::new(),
             theme: ThemeKind::Light,
             ui_scale: DEFAULT_UI_SCALE,
             nav_pane_w: DEFAULT_NAV_PANE_W,
             detail_pane_w: DEFAULT_DETAIL_PANE_W,
             nav_sections: default_nav_sections(),
+            detail_sections: default_detail_sections(),
             detail_col_w: default_detail_col_w(),
             // 0 = 还没按屏幕 DPI 折算过，首次拿到 DPI 时补成「实际 150%」
             scale_version: 0,
@@ -368,6 +463,22 @@ pub fn sanitize_nav_sections(order: Vec<NavSection>) -> Vec<NavSection> {
     out
 }
 
+/// 详情窗格模块顺序的清洗，规则与 [`sanitize_nav_sections`] 相同。
+pub fn sanitize_detail_sections(order: Vec<DetailSection>) -> Vec<DetailSection> {
+    let mut out: Vec<DetailSection> = Vec::with_capacity(DetailSection::ALL.len());
+    for s in order {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    for s in DetailSection::ALL {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 impl Settings {
     fn file(root: &Path) -> PathBuf {
         root.join("settings.json")
@@ -385,6 +496,10 @@ impl Settings {
                 s.ui_scale = clamp_ui_scale(s.ui_scale);
                 // 分组顺序同样可能被手改坏：补齐缺失的、去掉重复的
                 s.nav_sections = sanitize_nav_sections(std::mem::take(&mut s.nav_sections));
+                s.detail_sections =
+                    sanitize_detail_sections(std::mem::take(&mut s.detail_sections));
+                // 文件夹视图记忆可能被手改坏：去重、裁到上限
+                s.folder_views = sanitize_folder_views(std::mem::take(&mut s.folder_views));
                 s
             }
             Err(_) => Settings::default(),
@@ -401,3 +516,54 @@ impl Settings {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 文件夹视图记忆要真的进 JSON：只改内存中的字段，关掉软件就全忘了。
+    #[test]
+    fn folder_views_survive_json_round_trip() {
+        let mut s = Settings::default();
+        remember_folder_view(
+            &mut s.folder_views,
+            Path::new(r"D:\Media"),
+            ViewMode::Detail,
+            Sort { key: SortKey::Modified, descending: true },
+        );
+        let text = serde_json::to_string(&s).expect("序列化失败");
+        let back: Settings = serde_json::from_str(&text).expect("反序列化失败");
+        // 路径大小写不敏感：存的是小写，查的时候大写也要命中
+        let got = lookup_folder_view(&back.folder_views, Path::new(r"d:\media"))
+            .expect("文件夹视图记忆没写进 JSON");
+        assert_eq!(got.view, ViewMode::Detail);
+        assert_eq!(got.sort_key, SortKey::Modified);
+        assert!(got.sort_desc);
+    }
+
+    /// 详情窗格模块顺序的清洗：缺项补齐、重复去掉，顺序保留。
+    #[test]
+    fn sanitize_detail_sections_fills_and_dedups() {
+        assert_eq!(
+            sanitize_detail_sections(vec![DetailSection::Tags]),
+            [DetailSection::Tags, DetailSection::Info]
+        );
+        assert_eq!(
+            sanitize_detail_sections(vec![
+                DetailSection::Tags,
+                DetailSection::Tags,
+                DetailSection::Info,
+            ]),
+            [DetailSection::Tags, DetailSection::Info]
+        );
+        assert_eq!(
+            sanitize_detail_sections(vec![]),
+            DetailSection::ALL.to_vec()
+        );
+        // 合法顺序原样保留（不排序）
+        assert_eq!(
+            sanitize_detail_sections(vec![DetailSection::Tags, DetailSection::Info]),
+            [DetailSection::Tags, DetailSection::Info]
+        );
+    }
+}

@@ -144,6 +144,7 @@ pub fn list() -> Vec<Entry> {
                 type_name: String::new(),
                 icon_key,
                 volume: None,
+                origin: Some(slot.orig.clone()),
             }
         })
         .collect();
@@ -163,4 +164,46 @@ pub fn purge(data: &Path) -> Result<(), String> {
         let _ = std::fs::remove_file(meta);
     }
     res.map_err(|e| format!("{}: {e}", data.display()))
+}
+
+/// 把回收站里的一项还原到它删除前的位置，返回实际落地的路径。
+///
+/// 目标位置已经有同名文件时不覆盖，改成「名字 (2)」这类后缀——和资源管理器
+/// 的「保留两者」一个思路：宁可多出一个文件，也不能悄悄盖掉用户的东西。
+/// 成功才清掉 `$I` 元数据；失败留着，还能再试一次。
+pub fn restore(data: &Path) -> Result<PathBuf, String> {
+    let meta = meta_of(data).ok_or_else(|| "找不到回收站元数据".to_string())?;
+    let bytes = std::fs::read(&meta).map_err(|e| format!("读取元数据失败：{e}"))?;
+    let (orig, _, _) = parse_meta(&bytes).ok_or_else(|| "回收站元数据已损坏".to_string())?;
+    let dir = orig.parent().ok_or_else(|| "原始路径无效".to_string())?;
+    if !dir.is_dir() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("无法重建原目录：{e}"))?;
+    }
+
+    let target = unique_target(&orig);
+    std::fs::rename(data, &target).map_err(|e| format!("还原失败：{e}"))?;
+    let _ = std::fs::remove_file(&meta);
+    Ok(target)
+}
+
+/// 目标已存在时找一个不冲突的名字：`报告.docx` → `报告 (2).docx`。
+fn unique_target(p: &Path) -> PathBuf {
+    if !p.exists() {
+        return p.to_path_buf();
+    }
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "还原项".to_string());
+    let ext = p
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for n in 2..1000u32 {
+        let cand = p.with_file_name(format!("{stem} ({n}){ext}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    p.with_file_name(format!("{stem} (还原){ext}"))
 }

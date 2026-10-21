@@ -210,8 +210,8 @@ pub fn hit_test(app: &Application, x: i32, y: i32) -> Hit {
                 return Hit::DetailButton(i);
             }
         }
-        // 标签模块：只有「添加」chip 和每个 chip 右端的叉是可点的
         let sec = super::detailtags::sections(app);
+        // 标签模块：只有「添加」chip 和每个 chip 右端的叉是可点的
         if rect_contains(sec.tags.add, x, y) {
             return Hit::DetailTagAdd;
         }
@@ -219,6 +219,13 @@ pub fn hit_test(app: &Application, x: i32, y: i32) -> Hit {
             if rect_contains(c.close, x, y) {
                 return Hit::DetailTagClose(i);
             }
+        }
+        // 两个模块之间的分隔线是模块顺序的拖动把手：跨线 ±5px 都算它，
+        // 比一条 1px 的线好点中。排在 chip 之后——chips 是明确的小目标，
+        // 不能被一条横贯整行的热区抢走；剩下的空白足够拖。
+        let band = (5.0 * app.layout.scale).round() as i32;
+        if y >= sec.divider_mid - band && y <= sec.divider_mid + band {
+            return Hit::DetailSeparator(0);
         }
         return Hit::DetailPane;
     }
@@ -329,6 +336,14 @@ pub fn on_mouse_move(app: &mut Application, x: i32, y: i32) {
         app.mouse_x = x;
         app.mouse_y = y;
         app.nav_sep_move();
+        return;
+    }
+
+    // 拖详情窗格分割线：同上，换的是模块顺序
+    if app.detail_sep_drag.is_some() {
+        app.mouse_x = x;
+        app.mouse_y = y;
+        app.detail_sep_move();
         return;
     }
 
@@ -747,6 +762,13 @@ pub fn on_lbutton_down(app: &mut Application, x: i32, y: i32) {
         }
     }
 
+    // 详情窗格的分割线按下：同样立刻进入拖动，按下即明确意图
+    if let Hit::DetailSeparator(_) = h {
+        app.mouse_y = y;
+        app.detail_sep_press();
+        return;
+    }
+
     // 导航窗格快捷项按下：同样先记账，移动超过系统阈值才转成拖动排序
     if let Hit::NavItem(i) = h {
         if let Some(navpane::NavKind::Place { index, .. }) = app.nav_rows.get(i).map(|r| r.kind.clone())
@@ -850,6 +872,13 @@ pub fn on_lbutton_up(app: &mut Application, x: i32, y: i32) {
     if app.nav_sep_drag.is_some() {
         app.pressed = Hit::None;
         app.nav_sep_release();
+        return;
+    }
+
+    // 详情窗格分割线松手：同上
+    if app.detail_sep_drag.is_some() {
+        app.pressed = Hit::None;
+        app.detail_sep_release();
         return;
     }
 
@@ -1078,10 +1107,67 @@ pub fn on_rbutton_up(app: &mut Application, x: i32, y: i32) {
                     app.select_entry(i, false, false);
                 }
             }
-            None => app.tabs[app.active_tab].selected.clear(),
+            None => {
+                app.tabs[app.active_tab].selected.clear();
+                app.tabs[app.active_tab].focus = None;
+            }
         }
     }
+    // 回收站里的条目是 `$R` 物理路径，Shell 菜单只会给出「删除」这类
+    // 对回收站无意义的动作，也不会出现「还原」。这里自己给一份菜单。
+    if app.in_recycle_bin() && !app.tabs[app.active_tab].selected.is_empty() {
+        recycle_menu(app, x, y);
+        return;
+    }
     app.show_shell_context_menu();
+}
+
+/// 回收站条目的右键菜单：还原 / 彻底删除。
+fn recycle_menu(app: &mut Application, x: i32, y: i32) {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, SetForegroundWindow, TrackPopupMenu,
+        MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN,
+    };
+
+    const CMD_RESTORE: usize = 1;
+    const CMD_PURGE: usize = 2;
+
+    let n = app.tabs[app.active_tab].selected.len();
+    let restore = crate::win::to_wide(crate::strings::RECYCLE_RESTORE);
+    let purge = crate::win::to_wide(&format!("{} {n} 项", crate::strings::RECYCLE_PURGE));
+
+    unsafe {
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return;
+        }
+        AppendMenuW(menu, MF_STRING, CMD_RESTORE, restore.as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+        AppendMenuW(menu, MF_STRING, CMD_PURGE, purge.as_ptr());
+
+        let mut pt = POINT { x, y };
+        ClientToScreen(app.hwnd, &mut pt);
+        SetForegroundWindow(app.hwnd);
+        crate::win::init::apply_menu_theme();
+        let cmd = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
+            pt.x,
+            pt.y,
+            0,
+            app.hwnd,
+            std::ptr::null(),
+        );
+        DestroyMenu(menu);
+
+        match cmd as usize {
+            CMD_RESTORE => app.restore_recycle_selection(),
+            CMD_PURGE => app.delete_selection(true),
+            _ => {}
+        }
+    }
 }
 
 /// 详情窗格四个按钮的动作。
@@ -1968,6 +2054,11 @@ pub fn on_key_down(app: &mut Application, vk_raw: usize) -> bool {
         app.go_up();
         true
     }
+    // Alt+D：聚焦地址栏（资源管理器的老键位，和 Ctrl+L 等价）
+    VK_D if app.modifiers.alt => {
+        app.begin_address_edit();
+        true
+    }
     VK_RETURN if app.modifiers.alt => {
         if let Some(&i) = app.tabs[app.active_tab].selected.iter().next() {
             app.show_properties_entry(i);
@@ -1978,10 +2069,13 @@ pub fn on_key_down(app: &mut Application, vk_raw: usize) -> bool {
         VK_ESCAPE => {
             // 拖动分组分隔线中途按 Esc＝放弃这次拖动（和资源管理器一致）
             app.nav_sep_cancel();
+            app.detail_sep_cancel();
             true
         }
         VK_BACK => {
-            app.go_up();
+            // 资源管理器里 Backspace 是「后退」（回到上一个浏览位置）；
+            // 「上一级」是 Alt+↑。这两个以前被混成一件事了。
+            app.go_back();
             true
         }
         VK_RETURN => {
@@ -1995,7 +2089,12 @@ pub fn on_key_down(app: &mut Application, vk_raw: usize) -> bool {
             true
         }
         VK_DELETE => {
-            app.delete_selection(false);
+            // Shift+Delete 绕过回收站，资源管理器会先问一次；这里同样先确认
+            if app.modifiers.shift {
+                app.confirm_delete_permanent();
+            } else {
+                app.delete_selection(false);
+            }
             true
         }
         VK_F2 => {
@@ -2003,11 +2102,12 @@ pub fn on_key_down(app: &mut Application, vk_raw: usize) -> bool {
             true
         }
         VK_UP => {
-            app.move_selection(-1);
+            // Shift 扩展选择、Ctrl 只移动焦点框——两条资源管理器的规矩
+            app.move_selection_ex(-1, app.modifiers.shift, app.modifiers.ctrl);
             true
         }
         VK_DOWN => {
-            app.move_selection(1);
+            app.move_selection_ex(1, app.modifiers.shift, app.modifiers.ctrl);
             true
         }
         VK_HOME => {
@@ -2016,6 +2116,25 @@ pub fn on_key_down(app: &mut Application, vk_raw: usize) -> bool {
         }
         VK_END => {
             app.select_last();
+            true
+        }
+        // 翻页：一次一屏（行数 × 列数），和资源管理器一样
+        VK_PRIOR => {
+            app.move_selection_page(-1);
+            true
+        }
+        VK_NEXT => {
+            app.move_selection_page(1);
+            true
+        }
+        // F3：聚焦搜索框（资源管理器的搜索快捷键之一）
+        VK_F3 => {
+            app.focus_search();
+            true
+        }
+        // F4：展开地址栏历史下拉
+        VK_F4 => {
+            app.begin_address_edit();
             true
         }
 
@@ -2062,37 +2181,34 @@ pub fn on_key_down(app: &mut Application, vk_raw: usize) -> bool {
                 app.next_tab(1);
                 true
             }
-            // Ctrl+1..8 切换视图（快捷键表里的「切换视图」）
-            VK_1 => {
-                app.set_view_mode(crate::cfg::settings::ViewMode::LargeEx);
+            // Ctrl+1..9：切换标签（Win11 语义——1..8 指第 N 个，9 是最后一个）。
+            // 切换视图挪到 Ctrl+Shift+1..8，两者不再抢同一组键。
+            VK_1..=VK_9 if !app.modifiers.shift => {
+                let n = app.tabs.len();
+                if n > 0 {
+                    let want = if vk == VK_9 {
+                        n - 1
+                    } else {
+                        (vk - VK_1) as usize
+                    };
+                    app.set_active_tab(want.min(n - 1));
+                }
                 true
             }
-            VK_2 => {
-                app.set_view_mode(crate::cfg::settings::ViewMode::Large);
-                true
-            }
-            VK_3 => {
-                app.set_view_mode(crate::cfg::settings::ViewMode::Medium);
-                true
-            }
-            VK_4 => {
-                app.set_view_mode(crate::cfg::settings::ViewMode::Small);
-                true
-            }
-            VK_5 => {
-                app.set_view_mode(crate::cfg::settings::ViewMode::List);
-                true
-            }
-            VK_6 => {
-                app.set_view_mode(crate::cfg::settings::ViewMode::Detail);
-                true
-            }
-            VK_7 => {
-                app.set_view_mode(crate::cfg::settings::ViewMode::Tile);
-                true
-            }
-            VK_8 => {
-                app.set_view_mode(crate::cfg::settings::ViewMode::Content);
+            // Ctrl+Shift+1..8：切换视图（超大图标 … 内容）
+            VK_1..=VK_8 => {
+                use crate::cfg::settings::ViewMode;
+                let mode = match vk {
+                    VK_1 => ViewMode::LargeEx,
+                    VK_2 => ViewMode::Large,
+                    VK_3 => ViewMode::Medium,
+                    VK_4 => ViewMode::Small,
+                    VK_5 => ViewMode::List,
+                    VK_6 => ViewMode::Detail,
+                    VK_7 => ViewMode::Tile,
+                    _ => ViewMode::Content,
+                };
+                app.set_view_mode(mode);
                 true
             }
             _ => false,

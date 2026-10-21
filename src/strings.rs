@@ -126,6 +126,12 @@ pub const LABEL_NAME: &str = "名称";
 pub const LABEL_LOCATION: &str = "位置";
 pub const ADD_BOOKMARK_FOLDER_TITLE: &str = "新建书签目录";
 
+// ---------------------------------------------------------------- 类型名
+// 显示在详情窗格、详细信息窗格与列表视图的「类型」列上，
+// 同时是「按类型排序」的比较键——因此必须是用户眼里的那串文字。
+pub const TYPE_FOLDER: &str = "文件夹";
+pub const TYPE_FILE: &str = "文件";
+
 // ---------------------------------------------------------------- 状态栏与提示
 pub const STATUS_ITEMS: &str = "个项目";
 pub const STATUS_ITEMS_SELECTED: &str = "个项目被选中";
@@ -156,6 +162,10 @@ pub const NAV_VIDEOS: &str = "视频";
 pub const NAV_NETWORK: &str = "网络";
 /// 回收站：跟在「主文件夹」下面，和资源管理器一致。
 pub const NAV_RECYCLE: &str = "回收站";
+/// 回收站条目右键菜单：还原到删除前的位置。
+pub const RECYCLE_RESTORE: &str = "还原";
+/// 回收站条目右键菜单：彻底删除（不弹确认，与资源管理器一致）。
+pub const RECYCLE_PURGE: &str = "彻底删除";
 /// 快捷访问区空着时的提示（那一块是用户自己拖出来的）。
 pub const NAV_QUICK_EMPTY: &str = "拖动到此收藏";
 /// 快捷访问项的右键菜单：只做移除，不动磁盘上的东西。

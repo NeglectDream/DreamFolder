@@ -1389,6 +1389,12 @@ fn paint_grid_cell(
         canvas.round_fill(r, 3, palette.item_hover, None);
     }
 
+    // 焦点框：Ctrl+方向键只移动焦点、不改选择，没有可见标记的话
+    // 按下去像是毫无反应。多选时也画，用来指示键盘的起点在哪。
+    if app.tabs[app.active_tab].focus == Some(index) && (selection.len() > 1 || !selected) {
+        canvas.border(r, palette.text_dim);
+    }
+
     // 单元格内部的内边距同样要跟缩放走：写死像素值时，字号放大后
     // 文字行高还是老样子，名字会被裁掉一截。
     let sc = app.layout.scale;
@@ -1563,6 +1569,11 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
             );
         } else if hovered {
             canvas.fill(r, palette.item_hover);
+        }
+
+        // 焦点框（与网格视图同一规则）：Ctrl+方向键移动的可见落点
+        if app.tabs[active].focus == Some(idx) && (selection.len() > 1 || !selected) {
+            canvas.border(r, palette.text_dim);
         }
 
         let isz = s(16);
@@ -1752,16 +1763,33 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
         canvas.text(labels[i], *r, fg, font, TEXT_C);
     }
 
-    // ---- 两个内容模块：标签 / 文件明细，顺序由设置决定 ----
+    // ---- 两个内容模块：文件明细 / 标签，顺序由 detail_sections 决定 ----
     let sec = crate::ui::detailtags::sections(app);
     let tags = &sec.tags;
     let row_h = s(metrics::DETAIL_ROW_H);
     let pad = s(12);
 
-    // 分隔线：按钮区下沿一条、两个模块之间一条
+    // 分隔线：按钮区下沿一条、两个模块之间一条（后者是顺序拖动把手）
     canvas.hline(p.left + pad, p.right - pad, sec.divider_buttons, palette.border_light);
     if sec.divider_mid > sec.divider_buttons + s(4) {
-        canvas.hline(p.left + pad, p.right - pad, sec.divider_mid, palette.border_light);
+        // hover/拖动时高亮成强调色粗线：让人看出「这条线能抓」
+        // （与导航窗格分组分隔线同一套反馈）
+        let active = app.detail_sep_drag.is_some() || app.hover == Hit::DetailSeparator(0);
+        if active {
+            canvas.hline(p.left + pad, p.right - pad, sec.divider_mid, palette.accent);
+            canvas.hline(p.left + pad, p.right - pad, sec.divider_mid + 1, palette.accent);
+        } else {
+            canvas.hline(p.left + pad, p.right - pad, sec.divider_mid, palette.border_light);
+        }
+    }
+
+    // 模块顺序拖动中：在被拖模块即将落脚的位置画一条通栏指示线
+    if let Some(drag) = app.detail_sep_drag.as_ref() {
+        let y = crate::ui::detailtags::insertion_y(&sec, drag.slot);
+        canvas.fill(
+            rect(p.left + pad, y, p.right - pad, y + s(2)),
+            palette.accent,
+        );
     }
 
     canvas.text(
@@ -1842,7 +1870,7 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
     let label_w = s(64);
     let mut y = sec.info_top;
 
-    let rows: Vec<(&str, String)> = match &entry {
+    let mut rows: Vec<(&str, String)> = match &entry {
         Some(e) => vec![
             ("文件名", e.name.clone()),
             ("大小", {
@@ -1854,14 +1882,14 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
                 }
             }),
             ("类型", {
-                let t = if e.is_dir() {
-                    "文件夹".to_string()
+                // 与排序键取同一个来源：列里显示的字符串就是比较用的字符串
+                if e.is_dir() {
+                    crate::fs::typename::folder().to_string()
                 } else if !e.type_name.is_empty() {
                     e.type_name.clone()
                 } else {
-                    app.icons.type_name(&e.ext())
-                };
-                t
+                    crate::fs::typename::for_ext(&e.ext())
+                }
             }),
             ("修改时间", blank_dash(e.modified_text())),
             ("创建时间", blank_dash(e.created_text())),
@@ -1869,6 +1897,11 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
         ],
         None => vec![("文件名", "未选择".to_string())],
     };
+    // 回收站里的条目才有原位置——资源管理器的回收站同样把它列出来，
+    // 否则一堆同名文件根本分不清哪个是从哪删的。
+    if let Some(origin) = entry.as_ref().and_then(|e| e.origin.as_ref()) {
+        rows.push(("原位置", origin.display().to_string()));
+    }
 
     for (label, value) in rows {
         if y + row_h > p.bottom {

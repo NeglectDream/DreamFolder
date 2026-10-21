@@ -79,6 +79,9 @@ pub struct Entry {
     pub icon_key: IconKey,
     /// 驱动器容量。非驱动器恒为 `None`。
     pub volume: Option<Volume>,
+    /// 删除前的原路径。只有回收站里的条目有值——资源管理器的回收站也
+    /// 专门有一列「原位置」，否则一堆同名文件根本分不清谁是谁。
+    pub origin: Option<PathBuf>,
 }
 
 /// 图标查找键：同一扩展名共用一张图标。
@@ -177,9 +180,12 @@ impl Entry {
         filetime_to_local_text(self.accessed)
     }
 
-    /// 排序用的比较键（目录优先由调用方处理）。
-    pub fn sort_name_key(&self) -> String {
-        self.name.to_lowercase()
+    /// 排序用的名称比较键：资源管理器的自然排序键（见 `fs::sortkey`）。
+    ///
+    /// 这里只负责名称本身；「目录置顶」由 `fs::enumerate::sort_entries`
+    /// 在外层统一处理（四列一致），所以键里不再混入目录标志。
+    pub fn sort_name_key(&self) -> Vec<u16> {
+        crate::fs::sortkey::natural_key(&self.name)
     }
 }
 
@@ -307,6 +313,7 @@ mod tests {
             type_name: String::new(),
             icon_key: IconKey::Pending,
             volume: None,
+            origin: None,
         }
     }
 

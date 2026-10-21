@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetDC, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, ReleaseDC,
-    UpdateWindow, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    UpdateWindow, ValidateRect, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 // WM_MOUSELEAVE 在 windows-sys 里归到 UI::Controls，不在 WindowsAndMessaging。
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -90,6 +90,12 @@ const TIMER_HOVER: usize = 3;
 const TIMER_SEARCH: usize = 4;
 /// 定时器 ID：状态栏瞬态提示（如「已复制路径」）。一次性。
 const TIMER_NOTE: usize = 5;
+/// 定时器 ID：目录变化后的防抖刷新。一次性。
+const TIMER_FS: usize = 6;
+/// 目录变化的防抖窗口：一次复制几百个文件会连投上百条消息，凑成一次刷新。
+const FS_DEBOUNCE_MS: u32 = 300;
+/// 目录变化监听线程投过来的唤醒（只用来起防抖定时器）。
+pub const WM_APP_FS: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 2;
 /// 状态栏提示停留多久。
 const NOTE_MS: u32 = 3000;
 /// 搜索结果上限。搜索是「找得到就行」，不做全量列举。
@@ -161,6 +167,13 @@ pub struct Tab {
     pub selected: HashSet<usize>,
     /// 选择锚点（Shift 连选用）。
     pub anchor: Option<usize>,
+    /// 键盘焦点项。方向键从它出发；Shift 扩展、Ctrl 只移动焦点不改选择。
+    /// 与 `selected` 分开是资源管理器的基本模型——不分离就做不出
+    /// 「Ctrl+方向键移动焦点但不改变选中」。
+    pub focus: Option<usize>,
+    /// 刷新前记下的选中/焦点路径，枚举落地后按路径恢复（F5 后选中不丢）。
+    /// 只在同一个目录内刷新时有效，换目录由导航路径清空。
+    pub pending_keep: Option<(Vec<std::path::PathBuf>, Option<std::path::PathBuf>)>,
     pub scroll_y: i32,
     pub view_mode: ViewMode,
     pub loading: bool,
@@ -210,6 +223,8 @@ impl Tab {
             entries: Vec::new(),
             selected: HashSet::new(),
             anchor: None,
+            focus: None,
+            pending_keep: None,
             scroll_y: 0,
             view_mode,
             loading: false,
@@ -343,6 +358,12 @@ pub struct Application {
     // ---- 后台 IO ----
     /// 后台工作线程：枚举、容量、预览、搜索、文件操作都从这里出去。
     pub io: crate::io::Io,
+
+    /// 当前目录的变化监听（`ReadDirectoryChangesW`）。切目录时重建。
+    ///
+    /// 只在活动标签是真实目录时存在：外部程序往当前目录写文件时，
+    /// 界面要像资源管理器那样自己更新，而不是等用户按 F5。
+    pub watcher: Option<crate::fs::watch::DirWatcher>,
     /// 三类任务的请求号，只认最新的一个——过期结果直接丢，
     /// 这样「连续切目录」「连续换选中项」不会被旧结果覆盖。
     nav_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -357,6 +378,8 @@ pub struct Application {
     pub nav_groups: Vec<crate::ui::navpane::GroupSpan>,
     /// 正在拖动某条分组分隔线（＝拖动它下面那一组）。
     pub nav_sep_drag: Option<crate::ui::navpane::SepDrag>,
+    /// 正在拖动详情窗格的分割线（＝拖动它下面那个模块）。
+    pub detail_sep_drag: Option<crate::ui::detailtags::DetailSepDrag>,
     /// 导航窗格的纵向滚动量（设备像素，0 为顶端）。
     pub nav_scroll: i32,
     /// 导航窗格内容的可滚动余量，由 `navpane::build` 算出。
@@ -493,12 +516,14 @@ impl Application {
             tooltip_ready: false,
             preview: None,
             io: crate::io::Io::new(),
+            watcher: None,
             nav_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preview_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             search_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             preview_pending: None,
             nav_groups: Vec::new(),
             nav_sep_drag: None,
+            detail_sep_drag: None,
             nav_scroll: 0,
             nav_max_scroll: 0,
             nav_content_h: 0,
@@ -632,11 +657,25 @@ impl Application {
             } else {
                 SW_SHOWNORMAL
             };
-            ShowWindow(hwnd, show);
-            UpdateWindow(hwnd);
 
             // ---- 打开初始标签 ----
+            // 先建好标签再画首帧：窗口露面的那一瞬间就该是「完成品」，
+            // 而不是等着 UpdateWindow 再往里填内容。
             self.open_initial_tabs();
+
+            // 显示之前先把第一帧画到窗口表面。
+            //
+            // 类背景刷为 null、WM_ERASEBKGND 又恒返回 1，系统从不擦背景；
+            // 不做这一步的话，ShowWindow 让 DWM 开始合成的那一刻客户区里
+            // 什么都还没有，会闪出一块未初始化的白，随后才被首帧覆盖。
+            // 不可见窗口收不到 WM_PAINT，但窗口 DC 随时能画，所以直接画。
+            self.paint_first_frame(hwnd);
+            // 首帧已经落在表面上了，清掉 invalid 区，
+            // 免得 UpdateWindow 再把同一帧全画一遍
+            ValidateRect(hwnd, std::ptr::null());
+
+            ShowWindow(hwnd, show);
+            UpdateWindow(hwnd);
 
             // ---- 消息循环 ----
             let code = winwnd::message_loop();
@@ -645,6 +684,29 @@ impl Application {
         }
     }
 
+    /// 把第一帧直接画到窗口表面（显示之前调用，防启动白闪）。
+    ///
+    /// 与 WM_PAINT 走同一套 `draw::paint` + 双缓冲，只是取 DC 用 `GetDC`
+    /// 而不是 `BeginPaint`——后者只对系统标脏的区域有意义，而这里要的是
+    /// 「整窗先有一份完整内容」。
+    fn paint_first_frame(&mut self, hwnd: HWND) {
+        unsafe {
+            let hdc = GetDC(hwnd);
+            if hdc.is_null() {
+                return;
+            }
+            let client = winwnd::client_rect(hwnd);
+            let (w, h) = (client.right - client.left, client.bottom - client.top);
+            if w > 0 && h > 0 {
+                let (mem, _) = self.back_buffer.acquire(hdc, w, h);
+                if !mem.is_null() {
+                    crate::ui::draw::paint(self, mem, client);
+                    self.back_buffer.blit_to(hdc, 0, 0, w, h);
+                }
+            }
+            ReleaseDC(hwnd, hdc);
+        }
+    }
     /// 起始窗口尺寸。
     ///
     /// 用户没手动调整过窗口时（`window_geometry_set` 为 false，或几何仍是
@@ -895,8 +957,15 @@ impl Application {
             t.is_computer = false;
             t.is_recycle = true;
             t.title = "回收站".to_string();
+            // 回收站默认按删除时间倒序：刚删掉的东西应该在最上面。
+            // 资源管理器的回收站也是这个默认；用户点表头改排序后仍按他的选。
+            t.sort = crate::fs::enumerate::Sort {
+                key: crate::fs::enumerate::SortKey::Modified,
+                descending: true,
+            };
             t.selected.clear();
             t.anchor = None;
+            t.focus = None;
             t.scroll_y = 0;
             t.error = None;
             t.history.truncate(t.history_pos + 1);
@@ -1030,8 +1099,46 @@ impl Application {
             self.cfg.history.record(&path.to_string_lossy());
         }
 
+        // 这个目录以前用过什么视图/排序，就接着用（资源管理器的按文件夹记忆）
+        self.apply_folder_view(idx);
         self.reload_active_tab();
         self.sync_window_title();
+    }
+
+    /// 按目录记忆设置某个标签的视图与排序；没有记忆就保持调用方给的值。
+    fn apply_folder_view(&mut self, tab: usize) {
+        let Some(path) = self.tabs.get(tab).map(|t| t.path.clone()) else {
+            return;
+        };
+        if path.as_os_str().is_empty() || self.tabs[tab].is_recycle {
+            return;
+        }
+        let Some(v) = crate::cfg::settings::lookup_folder_view(&self.cfg.settings.folder_views, &path)
+            .cloned()
+        else {
+            return;
+        };
+        let t = &mut self.tabs[tab];
+        t.view_mode = v.view;
+        t.sort = Sort {
+            key: v.sort_key,
+            descending: v.sort_desc,
+        };
+    }
+
+    /// 把活动标签当前的视图与排序记到它所在目录名下。
+    pub(crate) fn remember_folder_view(&mut self) {
+        let Some(t) = self.active() else { return };
+        if t.is_computer || t.is_recycle || t.path.as_os_str().is_empty() {
+            return;
+        }
+        let (path, view, sort) = (t.path.clone(), t.view_mode, t.sort);
+        crate::cfg::settings::remember_folder_view(
+            &mut self.cfg.settings.folder_views,
+            &path,
+            view,
+            sort,
+        );
     }
 
     /// 把活动标签的标题同步到窗口标题。
@@ -1069,6 +1176,23 @@ impl Application {
             show_system: self.cfg.settings.show_hidden,
             sort: self.tabs[idx].sort,
         };
+
+        // 同目录刷新时按路径记住选中与焦点，落地后还原（资源管理器 F5 之后
+        // 选中项不会丢）。换目录的路径会先把 `selected` 清空，
+        // 这里记到的就是空集，天然不会把上一个目录的选择带过来。
+        if self.tabs[idx].pending_keep.is_none() {
+            let t = &self.tabs[idx];
+            let paths: Vec<PathBuf> = t
+                .selected
+                .iter()
+                .filter_map(|&i| t.entries.get(i).map(|e| e.full.clone()))
+                .collect();
+            let focus = t
+                .focus
+                .and_then(|i| t.entries.get(i))
+                .map(|e| e.full.clone());
+            self.tabs[idx].pending_keep = Some((paths, focus));
+        }
 
         let is_computer = self.tabs[idx].is_computer;
         let is_recycle = self.tabs[idx].is_recycle;
@@ -1122,7 +1246,61 @@ impl Application {
         // 标题跟着活动标签走。放在这里而不是只在 load_into_active 里：
         // 新建标签、刷新、切标签都走本函数，漏一处标题就会停在软件名上。
         self.sync_window_title();
+        self.resync_watcher();
         self.request_repaint();
+    }
+
+    /// 按活动标签重挂目录监听。
+    ///
+    /// 每次重挂都会先丢掉旧的：`DirWatcher::drop` 会通知监听线程退出并等它
+    /// 收尾，所以这里不会攒下一堆僵尸线程。
+    fn resync_watcher(&mut self) {
+        // 顺手收掉上次交出去、现在已经退出的监听线程
+        crate::fs::watch::reap_retired();
+        if self.hwnd.is_null() {
+            self.watcher = None;
+            return;
+        }
+        let Some(t) = self.active() else {
+            self.watcher = None;
+            return;
+        };
+        let target = if t.is_computer || t.is_recycle || t.path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(t.path.clone())
+        };
+        // 已经是同一个目录就留着：自动刷新会反复走这里，重挂一次要 join
+        // 监听线程，等于每次刷新白等一个等待周期。
+        if self.watcher.as_ref().map(|w| &w.path) == target.as_ref() {
+            return;
+        }
+        self.watcher = None;
+        if let Some(dir) = target {
+            self.watcher =
+                crate::fs::watch::DirWatcher::spawn(&dir, self.hwnd as isize, WM_APP_FS);
+        }
+    }
+
+    /// 目录变化防抖定时器到点：刷新当前列表。
+    ///
+    /// 编辑态（重命名 / 地址栏 / 搜索输入 / 对话框）下不刷新：列表一换，
+    /// 正在编辑的下标就失效，回车会改到别的文件上。宁可晚一点刷。
+    pub fn apply_fs_change(&mut self) {
+        if self.rename_active()
+            || self.address_editing
+            || self.search_focused
+            || self.dialog.is_some()
+        {
+            return;
+        }
+        let Some(t) = self.active() else { return };
+        // 正在加载、盘符视图都不刷；搜索结果也不能刷——刷新会把结果
+        // 换成目录内容，用户敲到一半的筛选就没了
+        if t.loading || t.is_computer || t.search_state.is_some() {
+            return;
+        }
+        self.refresh_active_tab();
     }
 
     /// 应用一条后台结果。过期的（请求号不是最新的）直接丢。
@@ -1152,13 +1330,29 @@ impl Application {
                 let _ = kind;
                 // 卷标可能比列表先回来，这里补一次回填
                 apply_drive_info(t);
-                // 之前记下的「加载完成后要选中的名字」（地址栏输入文件路径、
-                // 新建文件夹、重命名）在这里落地
+                // 之前记下的「加载完成后要选中的名字」（新建、重命名）优先；
+                // 否则还原刷新前的选中与焦点（按路径匹配，资源管理器 F5 之后
+                // 选中项不会丢）。
                 if let Some(name) = t.pending_select.take() {
                     if let Some(i) = t.entries.iter().position(|e| e.name == name) {
                         t.selected.clear();
                         t.selected.insert(i);
                         t.anchor = Some(i);
+                        t.focus = Some(i);
+                    }
+                } else if let Some((paths, focus)) = t.pending_keep.take() {
+                    if !paths.is_empty() || focus.is_some() {
+                        let mut selected = std::collections::HashSet::new();
+                        for (i, e) in t.entries.iter().enumerate() {
+                            if paths.iter().any(|p| p == &e.full) {
+                                selected.insert(i);
+                            }
+                        }
+                        let focus_at = focus
+                            .and_then(|p| t.entries.iter().position(|e| e.full == p));
+                        t.selected = selected;
+                        t.focus = focus_at;
+                        t.anchor = focus_at;
                     }
                 }
                 // 图标键/类型名在数据落地时补齐，绘制路径上只读
@@ -1225,6 +1419,11 @@ impl Application {
                 }
                 let found = hits.len();
                 t.entries = hits;
+                // 搜索结果是扁平列表，按当前标签的排序方式归位。资源管理器的
+                // 搜索结果同样跟随列表当前排序；不排的话用户看到的是目录遍历
+                // 顺序，同一类文件散落在各处，看着像随机。
+                let sort = t.sort;
+                crate::fs::enumerate::sort_entries(&mut t.entries, &sort);
                 t.selected.clear();
                 t.anchor = None;
                 t.scroll_y = 0;
@@ -1277,8 +1476,8 @@ impl Application {
     /// `Entry.type_name` 这两个本就是缓存的字段从来没被写回过。
     /// 现在改在数据进入 UI 状态的那一刻收尾，一屏 30 行只算一次。
     fn fill_entry_meta(&mut self, tab: usize) {
-        // 结构体解构拿到两个互不重叠的可变借用
-        let Application { icons, tabs, .. } = self;
+        // 解构只为了拿到 `tabs` 的可变借用（索引表在 self 上，不会冲突）
+        let Application { tabs, .. } = self;
         let Some(t) = tabs.get_mut(tab) else {
             return;
         };
@@ -1293,10 +1492,9 @@ impl Application {
             }
             if e.type_name.is_empty() {
                 e.type_name = if e.is_dir() {
-                    icons.dir_type_name()
+                    crate::fs::typename::folder().to_string()
                 } else {
-                    let ext = e.ext();
-                    icons.type_name(&ext)
+                    crate::fs::typename::for_ext(&e.ext())
                 };
             }
         }
@@ -1316,6 +1514,9 @@ impl Application {
         let tab = Tab::new(path, s.view_mode, Sort { key: s.sort_key, descending: s.sort_desc });
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
+        // 新标签打开的是一个具体的目录，用那个目录自己的记忆（如果有）
+        let idx = self.active_tab;
+        self.apply_folder_view(idx);
         self.reload_active_tab();
         self.request_repaint();
     }
@@ -1338,6 +1539,7 @@ impl Application {
         } else if self.active_tab > index {
             self.active_tab -= 1;
         }
+        self.resync_watcher();
         self.request_repaint();
     }
 
@@ -1347,6 +1549,8 @@ impl Application {
             // 谁在搜索、搜了什么、结果几条，都跟着标签走。
             self.active_tab = index;
             self.sync_window_title();
+            // 监听要跟着活动标签走，否则后台标签的目录变动会刷新到前台
+            self.resync_watcher();
             // 挂起的搜索若是在后台标签上加载完成的，切回来时补触发
             if self.tabs[index].pending_search && !self.tabs[index].loading {
                 self.tabs[index].pending_search = false;
@@ -1366,6 +1570,7 @@ impl Application {
         let next = ((cur + delta) % n + n) % n;
         self.active_tab = next as usize;
         self.sync_window_title();
+        self.resync_watcher();
         self.request_repaint();
     }
 
@@ -1377,6 +1582,12 @@ impl Application {
             .map(|e| e.full.clone())
     }
 
+    /// 当前焦点项：键盘移动的基准，没有时退回选择集中最小的一项。
+    pub fn focus_index(&self) -> Option<usize> {
+        let t = self.active()?;
+        t.focus.or_else(|| t.selected.iter().min().copied())
+    }
+
     pub fn select_entry(&mut self, index: usize, ctrl: bool, shift: bool) {
         {
             let Some(t) = self.active_mut() else { return };
@@ -1385,7 +1596,9 @@ impl Application {
             }
 
             if shift {
-                let anchor = t.anchor.unwrap_or(index);
+                // 以锚点为基准重建范围；焦点跟到目标项，锚点原地不动——
+                // 这正是资源管理器里 Shift+点击 后再 Shift+点击别处的行为。
+                let anchor = t.anchor.or(t.focus).unwrap_or(index);
                 let (lo, hi) = if anchor <= index {
                     (anchor, index)
                 } else {
@@ -1395,6 +1608,8 @@ impl Application {
                 for i in lo..=hi {
                     t.selected.insert(i);
                 }
+                t.anchor = Some(anchor);
+                t.focus = Some(index);
             } else if ctrl {
                 if t.selected.contains(&index) {
                     t.selected.remove(&index);
@@ -1402,10 +1617,12 @@ impl Application {
                     t.selected.insert(index);
                 }
                 t.anchor = Some(index);
+                t.focus = Some(index);
             } else {
                 t.selected.clear();
                 t.selected.insert(index);
                 t.anchor = Some(index);
+                t.focus = Some(index);
             }
         }
         self.request_repaint();
@@ -1414,6 +1631,10 @@ impl Application {
     pub fn select_all(&mut self) {
         let Some(t) = self.active_mut() else { return };
         t.selected = (0..t.entries.len()).collect();
+        // 全选后焦点留在原处（资源管理器也是），没有就落在第一项
+        if t.focus.is_none() && !t.entries.is_empty() {
+            t.focus = Some(0);
+        }
         self.request_repaint();
     }
 
@@ -1434,24 +1655,57 @@ impl Application {
         if let Some(t) = self.active_mut() {
             t.selected.clear();
             t.anchor = None;
+            t.focus = None;
         }
         self.request_repaint();
     }
 
-    pub fn move_selection(&mut self, delta: i32) {
-        // 先把需要的信息取出来，避免 &Tab 与后续 &mut self 冲突
-        let (n, cur) = {
-            let Some(t) = self.active() else { return };
-            let n = t.entries.len();
-            let cur = t.selected.iter().next().copied().unwrap_or(0) as i32;
-            (n, cur)
-        };
+    /// 方向键移动。`extend` = Shift（扩展选择），`focus_only` = Ctrl（只移焦点）。
+    ///
+    /// 资源管理器的三条规则：方向键单选移动、Shift+方向键从锚点扩展、
+    /// Ctrl+方向键只挪焦点框而不改已选中的东西。以前只实现了第一条。
+    pub fn move_selection_ex(&mut self, delta: i32, extend: bool, focus_only: bool) {
+        let n = self.active().map(|t| t.entries.len()).unwrap_or(0);
         if n == 0 {
             return;
         }
+        let cur = self.focus_index().unwrap_or(0) as i32;
         let next = (cur + delta).clamp(0, n as i32 - 1) as usize;
-        self.select_entry(next, false, false);
+
+        if focus_only {
+            if let Some(t) = self.active_mut() {
+                t.focus = Some(next);
+            }
+            interact::scroll_into_view(self, next);
+            self.request_repaint();
+            return;
+        }
+        self.select_entry(next, false, extend);
         interact::scroll_into_view(self, next);
+    }
+
+    pub fn move_selection(&mut self, delta: i32) {
+        self.move_selection_ex(delta, false, false);
+    }
+
+    /// 一屏能放多少项：按首项的宽高与视口算，行/列两种布局共用。
+    fn page_items(&self) -> usize {
+        let Some(t) = self.active() else { return 1 };
+        let vr = self.layout.view;
+        let vh = (vr.bottom - vr.top).max(1);
+        let vw = (vr.right - vr.left).max(1);
+        let r0 = self.layout.item_rect(t.view_mode, 0, 0);
+        let item_h = (r0.bottom - r0.top).max(1);
+        let item_w = (r0.right - r0.left).max(1);
+        let rows = (vh / item_h).max(1) as usize;
+        let cols = (vw / item_w).max(1) as usize;
+        (rows * cols).max(1)
+    }
+
+    /// 翻页移动选择：`dir` 为 -1 上翻、1 下翻（PageUp / PageDown）。
+    pub fn move_selection_page(&mut self, dir: i32) {
+        let step = self.page_items() as i32;
+        self.move_selection(dir * step);
     }
 
     /// 打开条目：目录则进入，文件则用默认程序打开。
@@ -1484,13 +1738,15 @@ impl Application {
 
     /// 空格键快速预览（对应 `enable_quickpreview`）。
     ///
-    /// 实现策略：小于 1 MiB 的文本类文件在状态栏滚动显示前若干行；
-    /// 图片交给系统照片查看器。这里保持轻量，不引入图像解码依赖。
+    /// 资源管理器的空格是「在预览窗格里看一眼当前项」，**从不调用外部程序**。
+    /// 以前这里对非文本类型直接 `shell::open_default`——按一下空格，照片就在
+    /// 照片查看器里弹出来，等于把「预览」变成了「打开」。现在统一落到详情
+    /// 窗格顶部的预览框：图片走 GDI+，文本摊成若干行。
     pub fn quick_preview_selection(&mut self) {
         if !self.cfg.settings.enable_quickpreview {
             return;
         }
-        let Some(&i) = self.active().and_then(|t| t.selected.iter().next()) else {
+        let Some(&i) = self.active().and_then(|t| t.selected.iter().min()) else {
             return;
         };
         let Some(entry) = self.active().and_then(|t| t.entries.get(i)).cloned() else {
@@ -1499,27 +1755,13 @@ impl Application {
         if entry.is_dir() {
             return;
         }
-
-        const TEXT_MAX: u64 = 1024 * 1024;
-        let ext = entry.ext();
-        let is_text = matches!(
-            ext.as_str(),
-            "txt" | "md" | "json" | "toml" | "yaml" | "yml" | "ini" | "log" | "rs" | "c" | "h"
-                | "cpp" | "hpp" | "cs" | "py" | "js" | "ts" | "html" | "css" | "xml" | "bat"
-                | "cmd" | "ps1" | "sh"
-        );
-
-        if is_text && entry.size <= TEXT_MAX {
-            match std::fs::read_to_string(&entry.full) {
-                Ok(text) => {
-                    let preview: String = text.lines().take(12).collect::<Vec<_>>().join("\n");
-                    self.show_message(&preview);
-                }
-                Err(e) => self.show_message(&format!("无法预览：{e}")),
-            }
-        } else {
-            let _ = shell::open_default(self.hwnd, &entry.full);
+        // 详情窗格关着就无处显示：先把它打开，预览在它的顶部
+        if !self.cfg.settings.show_detail_pane {
+            self.cfg.settings.show_detail_pane = true;
+            self.recompute_layout();
         }
+        self.ensure_preview(Some(entry.full.clone()), &entry.ext(), entry.size);
+        self.request_repaint();
     }
 
     // ------------------------------------------------------------ 视图滚动
@@ -2097,6 +2339,19 @@ impl Application {
                 self.open_recycle_bin();
                 return;
             }
+            // 网址：交给默认浏览器。资源管理器的地址栏也接受网址，
+            // 以前粘贴一个链接会被当成路径，回一句「无法访问该位置」。
+            if fs::looks_like_url(&text) {
+                if let Err(e) = shell::open_url(&fs::normalize_url(&text)) {
+                    self.show_message(&e);
+                }
+                return;
+            }
+            // `shell:` 命名空间别名（shell:startup、shell:downloads 等）
+            if let Some(p) = fs::resolve_shell_alias(&text) {
+                self.navigate_to(p);
+                return;
+            }
             if let Some(p) = fs::resolve_path(&text) {
                 if p.is_dir() {
                     self.navigate_to(p);
@@ -2283,6 +2538,13 @@ impl Application {
 
         match d.intent.clone() {
             DialogIntent::Info => {}
+            // Shift+Delete 确认通过：永久删除（不经过回收站）
+            DialogIntent::DeletePermanent { items } => {
+                self.send_op(crate::io::OpWhat::Delete {
+                    items,
+                    permanent: true,
+                });
+            }
             DialogIntent::RestoreExplorer => {
                 if let Err(e) = crate::shell_integration::restore() {
                     self.dialog_info(&e);
@@ -2683,6 +2945,62 @@ impl Application {
     /// 取消拖动（Esc 或窗口失焦）。
     pub fn nav_sep_cancel(&mut self) {
         if self.nav_sep_drag.take().is_some() {
+            self.request_repaint();
+        }
+    }
+
+    // ------------------------------------------------------ 详情窗格模块顺序
+
+    /// 在详情窗格的两个模块之间按下：开始拖动下面那个模块。
+    pub fn detail_sep_press(&mut self) {
+        // 分割线下面那个模块就是被拖的对象；sanitize 保证列表里恰好两个模块
+        let Some(module) = self.cfg.settings.detail_sections.get(1).copied() else {
+            // 只有一个模块时没有可换位的对象（配置被手改坏时的兜底）
+            return;
+        };
+        let sec = crate::ui::detailtags::sections(self);
+        let slot = crate::ui::detailtags::insertion_slot(&sec, self.mouse_y);
+        self.detail_sep_drag = Some(crate::ui::detailtags::DetailSepDrag { module, slot });
+        self.request_repaint();
+    }
+
+    /// 拖动中：按指针位置更新目标槽位，并画插入指示线。
+    pub fn detail_sep_move(&mut self) {
+        if self.detail_sep_drag.is_none() {
+            return;
+        }
+        let slot = crate::ui::detailtags::insertion_slot(
+            &crate::ui::detailtags::sections(self),
+            self.mouse_y,
+        );
+        let Some(drag) = self.detail_sep_drag.as_mut() else {
+            return;
+        };
+        if drag.slot != slot {
+            drag.slot = slot;
+            self.request_repaint();
+        }
+    }
+
+    /// 松开：顺序真变了就落盘。
+    pub fn detail_sep_release(&mut self) {
+        let Some(drag) = self.detail_sep_drag.take() else {
+            return;
+        };
+        let order = &self.cfg.settings.detail_sections;
+        if !drag.changed(order) {
+            self.request_repaint();
+            return;
+        }
+        self.cfg.settings.detail_sections =
+            crate::ui::detailtags::reorder(order, drag.module, drag.slot);
+        self.cfg.settings.save(&self.cfg.root);
+        self.request_repaint();
+    }
+
+    /// 取消拖动（Esc 或窗口失焦）。
+    pub fn detail_sep_cancel(&mut self) {
+        if self.detail_sep_drag.take().is_some() {
             self.request_repaint();
         }
     }

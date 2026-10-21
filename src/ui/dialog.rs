@@ -54,6 +54,8 @@ pub enum DialogIntent {
     RemoveTag(usize),
     /// 多标签关窗确认通过：真正关掉窗口（见 `request_close`）。
     ExitApp,
+    /// Shift+Delete 确认通过：永久删除这些路径（不经过回收站）。
+    DeletePermanent { items: Vec<PathBuf> },
 }
 
 /// 标签预设色（`#RRGGBB`，绘制前转成 COLORREF）。

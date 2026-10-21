@@ -40,10 +40,26 @@ pub(crate) unsafe extern "system" fn wnd_proc(
             0
         }
         WM_SIZE => {
+            use windows_sys::Win32::Graphics::Gdi::{RedrawWindow, RDW_INVALIDATE, RDW_UPDATENOW};
             app.recompute_layout();
-            app.request_repaint();
+            // 立即同步重绘。只置 invalid 的话，新露出的那条区域在下一帧
+            // WM_PAINT 之前是未初始化的表面——拖动边缘缩放、最大化/还原时
+            // 边缘会一闪白。同步画一帧的代价和必然后发生的那一帧相同。
+            RedrawWindow(
+                hwnd,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                RDW_INVALIDATE | RDW_UPDATENOW,
+            );
             0
         }
+        // 无边框窗口：非客户区（那条系统画的激活边框）不需要，
+        // 也不该在焦点切换那一刻按主题色重画一遍——浅色主题下就是
+        // 一闪而过的一条白边。返回 TRUE 表示「激活状态我已经处理」。
+        WM_NCACTIVATE => 1,
+        // 同上：DefWindowProc 会按 WS_THICKFRAME 画默认 sizing frame，
+        // 我们整窗自绘，轮不到它。
+        WM_NCPAINT => 0,
         WM_DPICHANGED => {
             app.update_dpi(hwnd);
             // 使用系统建议的窗口矩形
@@ -210,6 +226,14 @@ pub(crate) unsafe extern "system" fn wnd_proc(
             app.drain_io();
             0
         }
+        // 被监听的目录有变化。复制几百个文件会连投上百条，这里只负责起
+        // 一个防抖定时器，真正刷新放到 TIMER_FS 到点之后。
+        crate::app::WM_APP_FS => {
+            unsafe {
+                SetTimer(hwnd, TIMER_FS, crate::app::FS_DEBOUNCE_MS, None);
+            }
+            0
+        }
         WM_TIMER => {
             if wparam == TIMER_CARET {
                 // 还有编辑态就催一帧重绘让插入符翻面；都结束了就自己停。
@@ -255,6 +279,12 @@ pub(crate) unsafe extern "system" fn wnd_proc(
                 KillTimer(hwnd, TIMER_NOTE);
                 app.status_note = None;
                 app.request_repaint();
+                return 0;
+            }
+            if wparam == TIMER_FS {
+                // 一次性：目录变化的防抖窗口结束，这时候刷才不会一次刷十几遍
+                KillTimer(hwnd, TIMER_FS);
+                app.apply_fs_change();
                 return 0;
             }
             if wparam == TIMER_PIPE {
@@ -407,6 +437,9 @@ pub(crate) unsafe extern "system" fn wnd_proc(
         }
         WM_DESTROY => {
             app.save_state();
+            // 监听线程手里握着这个窗口的句柄。留着等 Application 析构才收
+            // 也可以，但窗口句柄一旦被系统回收复用，迟到的消息会投错地方。
+            app.watcher = None;
             if app.pipe.is_some() {
                 KillTimer(hwnd, TIMER_PIPE);
             }

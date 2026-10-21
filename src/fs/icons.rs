@@ -21,7 +21,6 @@ const SHGFI_ICON: u32 = 0x0000_0100;
 const SHGFI_LARGEICON: u32 = 0x0000_0000;
 const SHGFI_SMALLICON: u32 = 0x0000_0001;
 const SHGFI_USEFILEATTRIBUTES: u32 = 0x0000_0010;
-const SHGFI_TYPENAME: u32 = 0x0000_0400;
 const SHGFI_SYSICONINDEX: u32 = 0x0000_4000;
 
 /// 系统「超大」图像列表（256px）。
@@ -69,10 +68,9 @@ fn store_capped(
 }
 
 /// 图标缓存。挂在 UI 状态上，随进程存活。
-pub struct IconCache {    small: HashMap<IconKey, isize>,
+pub struct IconCache {
+    small: HashMap<IconKey, isize>,
     large: HashMap<IconKey, isize>,
-    /// 扩展名 → 类型名（"txt" → "文本文档"）
-    type_names: HashMap<String, String>,
     /// 通用文件夹图标（一次查询，全程复用）
     folder_small: isize,
     folder_large: isize,
@@ -86,7 +84,6 @@ impl IconCache {
         IconCache {
             small: HashMap::with_capacity(64),
             large: HashMap::with_capacity(64),
-            type_names: HashMap::with_capacity(64),
             folder_small: 0,
             folder_large: 0,
             drive_small: 0,
@@ -234,33 +231,6 @@ impl IconCache {
         };
         let w = to_wide(&fake_name);
         unsafe { shell_icon(w.as_ptr(), attrs, size, true) }
-    }
-
-    /// 取文件类型描述（"文本文档"），带缓存。
-    pub fn type_name(&mut self, ext: &str) -> String {
-        let key = ext.to_ascii_lowercase();
-        if let Some(v) = self.type_names.get(&key) {
-            return v.clone();
-        }
-        let name = if key.is_empty() {
-            "文件".to_string()
-        } else {
-            let fake = to_wide(&format!("x.{key}"));
-            unsafe { shell_type_name(fake.as_ptr()) }
-        };
-        self.type_names.insert(key, name.clone());
-        name
-    }
-
-    /// 为目录补上类型描述。
-    pub fn dir_type_name(&self) -> String {
-        "文件夹".to_string()
-    }
-}
-
-impl Default for IconCache {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -429,25 +399,6 @@ unsafe fn jumbo_icon(
     } else {
         hicon
     }
-}
-
-/// 取文件类型描述。
-///
-/// # Safety
-/// `path` 必须是 NUL 结尾的宽串指针。
-unsafe fn shell_type_name(path: *const u16) -> String {
-    let mut info: SHFILEINFOW = std::mem::zeroed();
-    let ret = SHGetFileInfoW(
-        path,
-        FILE_ATTRIBUTE_NORMAL,
-        &mut info,
-        std::mem::size_of::<SHFILEINFOW>() as u32,
-        SHGFI_TYPENAME | SHGFI_USEFILEATTRIBUTES,
-    );
-    if ret == 0 {
-        return "文件".to_string();
-    }
-    crate::win::from_wide(&info.szTypeName)
 }
 
 /// 图标必须取自文件本身的扩展名。

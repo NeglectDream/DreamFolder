@@ -14,8 +14,8 @@ use crate::win::paint::{rect, rect_contains};
 
 /// 面板宽（逻辑像素）。
 const PANEL_W: i32 = 520;
-/// 面板高：头部 + 13 行 + 上下余量。
-const PANEL_H: i32 = 658;
+/// 面板高：头部 + 12 行 + 上下余量。
+const PANEL_H: i32 = 614;
 /// 一行的高度。
 const ROW_H: i32 = 44;
 /// 面板内边距。
@@ -33,8 +33,6 @@ pub enum Id {
     Toolbar,
     NavPane,
     DetailPane,
-    /// 详情窗格里标签模块排在文件明细上方。
-    TagsFirst,
     Extensions,
     Hidden,
     DbClickParent,
@@ -56,13 +54,12 @@ pub struct Item {
 }
 
 /// 面板里的全部行，顺序即显示顺序。
-pub const ITEMS: [Item; 13] = [
+pub const ITEMS: [Item; 12] = [
     Item { label: "深色模式", id: Id::Theme },
     Item { label: "显示书签栏", id: Id::Favbar },
     Item { label: "显示工具栏", id: Id::Toolbar },
     Item { label: "显示导航窗格", id: Id::NavPane },
     Item { label: "显示详细信息窗格", id: Id::DetailPane },
-    Item { label: "标签排在明细上方", id: Id::TagsFirst },
     Item { label: "显示文件扩展名", id: Id::Extensions },
     Item { label: "显示隐藏文件", id: Id::Hidden },
     Item { label: "双击空白返回上级", id: Id::DbClickParent },
@@ -226,7 +223,6 @@ pub fn value_of(app: &Application, id: Id) -> bool {
         Id::Toolbar => s.toolbar_visible,
         Id::NavPane => s.show_nav_pane,
         Id::DetailPane => s.show_detail_pane,
-        Id::TagsFirst => s.detail_tags_first,
         Id::Extensions => s.show_extension,
         Id::Hidden => s.show_hidden,
         Id::DbClickParent => s.dbclick_to_parent,
@@ -247,7 +243,6 @@ pub fn toggle(app: &mut Application, id: Id) {
             Id::Toolbar => s.toolbar_visible = !s.toolbar_visible,
             Id::NavPane => s.show_nav_pane = !s.show_nav_pane,
             Id::DetailPane => s.show_detail_pane = !s.show_detail_pane,
-            Id::TagsFirst => s.detail_tags_first = !s.detail_tags_first,
             Id::Extensions => s.show_extension = !s.show_extension,
             Id::Hidden => s.show_hidden = !s.show_hidden,
             Id::DbClickParent => s.dbclick_to_parent = !s.dbclick_to_parent,

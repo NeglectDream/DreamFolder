@@ -151,6 +151,48 @@ pub fn run_with_program(program: &Path, args: &[std::path::PathBuf]) -> Result<(
     }
 }
 
+/// `DROPFILES` 头部大小（`pFiles: DWORD` + `pt: POINT` + `fNC: BOOL` + `fWide: BOOL`）。
+const DROPFILES_SIZE: usize = 20;
+
+/// 拼装 CF_HDROP 的载荷：`DROPFILES` 头 + 双 NUL 结尾的宽字符路径列表。
+///
+/// 字段偏移按 WinUser.h 的定义逐个对齐：
+///
+/// ```text
+/// offset 0  DWORD pFiles     —— 字符串区起点（= 20）
+/// offset 4  LONG  pt.x
+/// offset 8  LONG  pt.y
+/// offset 12 BOOL  fNC
+/// offset 16 BOOL  fWide      —— 必须为 TRUE，否则系统按 ANSI 解析宽字符串，
+///                              `C:\...` 会被读成 `C`，粘贴时 Shell 报
+///                              「操作失败（代码 0x2）」
+/// ```
+///
+/// 抽成纯函数是为了能被单测逐字节校验——原先直接往 `GlobalLock` 出来的
+/// 指针上按 `u32` 下标 `.add(n)` 写，把 pt/fNC/fWide 全写错了位置，
+/// 连路径首字符都被压成 NUL。
+fn build_dropfiles(paths: &[std::path::PathBuf]) -> Vec<u8> {
+    let mut wide: Vec<u16> = Vec::new();
+    for p in paths {
+        wide.extend(p.to_string_lossy().encode_utf16());
+        wide.push(0);
+    }
+    wide.push(0); // 列表整体再补一个 NUL
+
+    let mut buf = vec![0u8; DROPFILES_SIZE + wide.len() * 2];
+    let header = buf.as_mut_ptr() as *mut u32;
+    unsafe {
+        *header = DROPFILES_SIZE as u32; // pFiles = 0
+        *header.add(1) = 0; // pt.x = 4
+        *header.add(2) = 0; // pt.y = 8
+        *header.add(3) = 0; // fNC  = 12
+        *header.add(4) = 1; // fWide = 16，宽字符
+        let dst = buf.as_mut_ptr().add(DROPFILES_SIZE) as *mut u16;
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
+    }
+    buf
+}
+
 /// 把路径放到系统剪贴板（CF_HDROP 格式），供别的程序粘贴。
 pub fn set_clipboard_files(paths: &[std::path::PathBuf]) -> bool {
     use windows_sys::Win32::System::DataExchange::{
@@ -159,8 +201,7 @@ pub fn set_clipboard_files(paths: &[std::path::PathBuf]) -> bool {
     use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows_sys::Win32::System::Ole::CF_HDROP;
 
-    // DROPFILES 结构：pFiles 偏移 + pt + fNC + fWide
-    const DROPFILES_SIZE: usize = 20;
+    let payload = build_dropfiles(paths);
 
     unsafe {
         if OpenClipboard(std::ptr::null_mut()) == 0 {
@@ -171,16 +212,7 @@ pub fn set_clipboard_files(paths: &[std::path::PathBuf]) -> bool {
             return false;
         }
 
-        // 拼装双 NUL 结尾的宽字符路径列表
-        let mut wide: Vec<u16> = Vec::new();
-        for p in paths {
-            wide.extend(p.to_string_lossy().encode_utf16());
-            wide.push(0);
-        }
-        wide.push(0);
-
-        let total = DROPFILES_SIZE + wide.len() * 2;
-        let hmem = GlobalAlloc(GMEM_MOVEABLE, total);
+        let hmem = GlobalAlloc(GMEM_MOVEABLE, payload.len());
         if hmem.is_null() {
             CloseClipboard();
             return false;
@@ -190,18 +222,7 @@ pub fn set_clipboard_files(paths: &[std::path::PathBuf]) -> bool {
             CloseClipboard();
             return false;
         }
-
-        // DROPFILES { DWORD pFiles; POINT pt; BOOL fNC; BOOL fWide; }
-        std::ptr::write_bytes(base, 0, DROPFILES_SIZE);
-        *(base as *mut u32) = DROPFILES_SIZE as u32; // pFiles
-        // pt = {0,0} 已由 write_bytes 清零
-        *((base as *mut u32).add(4)) = 0; // pt.x
-        *((base as *mut u32).add(5)) = 0; // pt.y
-        *((base as *mut i32).add(6)) = 0; // fNC = FALSE
-        *((base as *mut i32).add(7)) = 1; // fWide = TRUE
-
-        let dst = base.add(DROPFILES_SIZE) as *mut u16;
-        std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), base, payload.len());
 
         GlobalUnlock(hmem);
         SetClipboardData(CF_HDROP as u32, hmem);
@@ -393,5 +414,49 @@ pub fn known_folder(folder: KnownFolder) -> Option<std::path::PathBuf> {
         None
     } else {
         Some(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// DROPFILES 头逐字段校验：pFiles=20、pt={0,0}、fNC=0、fWide=1，
+    /// 字符串区从 20 起且双 NUL 结尾。
+    ///
+    /// 这组偏移曾经全写错位——`fWide` 被清成 0 后系统按 ANSI 解析宽路径，
+    /// `C:\...` 变成 `C`，粘贴时 Shell 报「操作失败（代码 0x2）」。
+    #[test]
+    fn dropfiles_header_layout() {
+        let payload = build_dropfiles(&[PathBuf::from(r"C:\dir\file.txt")]);
+        let u32_at = |off: usize| u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+
+        assert_eq!(u32_at(0), 20, "pFiles 必须指向字符串区");
+        assert_eq!(u32_at(4), 0, "pt.x");
+        assert_eq!(u32_at(8), 0, "pt.y");
+        assert_eq!(u32_at(12), 0, "fNC");
+        assert_eq!(u32_at(16), 1, "fWide 必须为 TRUE");
+
+        // 字符串区：宽字符，逐个对上，末尾双 NUL
+        let wide: Vec<u16> = payload[20..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let expect: Vec<u16> = r"C:\dir\file.txt".encode_utf16().chain([0, 0]).collect();
+        assert_eq!(wide, expect);
+    }
+
+    /// 多个路径之间用一个 NUL 分隔，整体双 NUL 结尾。
+    #[test]
+    fn dropfiles_multiple_paths() {
+        let payload = build_dropfiles(&[PathBuf::from("C:/a"), PathBuf::from("C:/b")]);
+        let wide: Vec<u16> = payload[20..]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let s = String::from_utf16(&wide[..6]).unwrap();
+        assert_eq!(s, "C:/a\0C"); // 第一个路径后是单个 NUL
+        assert_eq!(&wide[wide.len() - 2..], &[0, 0], "整体双 NUL 结尾");
     }
 }
