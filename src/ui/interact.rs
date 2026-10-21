@@ -113,8 +113,12 @@ pub fn hit_test(app: &Application, x: i32, y: i32) -> Hit {
             return Hit::Search;
         }
         if rect_contains(l.address, x, y) {
-            // 地址栏整条就是一个文本输入框：点哪儿都只是「开始编辑」，
-            // 光标按点击位置落位（见 `begin_address_edit_at`）。
+            // 地址栏分两种命中：点在某一段路径上＝跳到那一层；点在空白处
+            // ＝进编辑态并把光标落到点击位置（见 `begin_address_edit_at`）。
+            // 段区间由绘制层回填，两边共用同一份像素。
+            if !app.address_editing && app.address_segment_at(x).is_some() {
+                return Hit::AddressLevel;
+            }
             return Hit::Address;
         }
         return Hit::None;
@@ -597,43 +601,12 @@ fn start_item_drag(app: &mut Application, idx: usize) {
     let dropped = crate::win::dragdrop::start(&paths, true);
     app.request_repaint();
 
-    // 拖到收藏栏上松手 → 收藏。
+    // 松手点先换算成客户区坐标，只算一次。
     //
-    // 主路径是 IDropTarget 回调留下的标记；下面的落点判定作为兜底，
-    // 万一放置目标没注册成功（OLE 未初始化之类）也还能收藏。
-    let on_favbar = crate::win::droptarget::take_drop_flag()
-        || dropped.is_some_and(|(sx, sy)| {
-            use windows_sys::Win32::Foundation::POINT;
-            use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
-            let mut pt = POINT { x: sx, y: sy };
-            let ok = unsafe { ScreenToClient(app.hwnd, &mut pt) };
-            ok != 0 && rect_contains(app.layout.favbar, pt.x, pt.y)
-        });
-    if on_favbar {
-        app.add_paths_to_bookmarks(&paths);
-        return;
-    }
-
-    // 拖到导航窗格上松手 → 加进「快捷访问」区
-    //
-    // 先取标记再算落点：标记必须先被消费掉，否则会残留到下一次拖动上。
-    let nav_flag = crate::win::droptarget::take_nav_drop_flag();
-    let on_nav = nav_flag
-        || dropped.is_some_and(|(sx, sy)| {
-            use windows_sys::Win32::Foundation::POINT;
-            use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
-            let mut pt = POINT { x: sx, y: sy };
-            let ok = unsafe { ScreenToClient(app.hwnd, &mut pt) };
-            ok != 0 && rect_contains(app.layout.nav_pane, pt.x, pt.y)
-        });
-    if on_nav {
-        app.add_paths_to_nav_places(&paths);
-        return;
-    }
-
-    // 拖到文件视图上松手：落在文件夹上就移进去，落在可执行文件上就运行它，
-    // 落在空白处就移进当前目录。落点用「松手那一刻」的坐标算。
-    let pt = crate::win::droptarget::take_drop_point().or_else(|| {
+    // 主路径是 IDropTarget 在 `Drop` 里记下的落点；`dropped` 的屏幕坐标是
+    // 兜底，万一放置目标没注册成功（OLE 未初始化之类）也还能判落点。
+    // 三个分支共用同一个点，免得各自算出细微不同的位置。
+    let drop_pt = crate::win::droptarget::take_drop_point().or_else(|| {
         dropped.and_then(|(sx, sy)| {
             use windows_sys::Win32::Foundation::POINT;
             use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
@@ -642,7 +615,27 @@ fn start_item_drag(app: &mut Application, idx: usize) {
             (ok != 0).then_some((p.x, p.y))
         })
     });
-    if let Some(pt) = pt {
+
+    // 拖到收藏栏上松手 → 收藏
+    let on_favbar = crate::win::droptarget::take_drop_flag()
+        || drop_pt.is_some_and(|(x, y)| rect_contains(app.layout.favbar, x, y));
+    if on_favbar {
+        app.add_paths_to_bookmarks(&paths);
+        return;
+    }
+
+    // 拖到导航窗格上松手 → 落在标签行就打标签，否则加进「快捷访问」。
+    // 标记必须先消费掉，否则会残留到下一次拖动上。
+    let nav_flag = crate::win::droptarget::take_nav_drop_flag();
+    let on_nav = nav_flag || drop_pt.is_some_and(|(x, y)| rect_contains(app.layout.nav_pane, x, y));
+    if on_nav {
+        app.drop_paths_onto_nav(&paths, drop_pt);
+        return;
+    }
+
+    // 拖到文件视图上松手：落在文件夹上就移进去，落在可执行文件上就运行它，
+    // 落在空白处就移进当前目录。落点用「松手那一刻」的坐标算。
+    if let Some(pt) = drop_pt {
         app.drop_paths_onto_view(paths, pt);
     }
 }
@@ -965,7 +958,7 @@ pub fn on_lbutton_up(app: &mut Application, x: i32, y: i32) {
             app.close_tab(i, false);
         }
         Hit::NewTab => {
-            app.new_tab(None);
+            app.new_computer_tab();
         }
         Hit::MenuButton => {
             app.show_main_menu();
@@ -978,6 +971,7 @@ pub fn on_lbutton_up(app: &mut Application, x: i32, y: i32) {
         Hit::Up => app.go_up(),
         Hit::Refresh => app.refresh_active_tab(),
         Hit::Address => app.begin_address_edit_at(x),
+        Hit::AddressLevel => app.jump_to_address_level(x),
         Hit::Search => app.focus_search(),
         // 点历史下拉里的某一条＝直接跳过去
         Hit::AddrSuggest(i) => app.accept_addr_suggest(i),
@@ -1003,6 +997,11 @@ pub fn on_lbutton_up(app: &mut Application, x: i32, y: i32) {
         }
         Hit::FavoriteMore => favorite_more_menu(app, x, y),
         Hit::ListItem(i) => {
+            // 重命名中点了别的条目：先结束编辑（提交），否则编辑框还挂在
+            // 旧文件上，回车会改到用户以为已经放弃的那一项。
+            if app.rename_active() && app.rename_state().map(|(t, _, _)| t) != Some(i) {
+                app.commit_edit();
+            }
             let ctrl = app.modifiers.ctrl;
             let shift = app.modifiers.shift;
             app.select_entry(i, ctrl, shift);
@@ -1028,6 +1027,8 @@ pub fn on_lbutton_up(app: &mut Application, x: i32, y: i32) {
         Hit::ViewToggle(1) => app.set_view_mode(crate::cfg::settings::ViewMode::Large),
         Hit::SettingsClose => {
             app.settings_open = false;
+            app.flush_pending_fs_refresh();
+            app.request_repaint();
         }
         Hit::SettingsItem(i) => {
             if let Some(item) = super::settingspane::ITEMS.get(i) {
@@ -1939,6 +1940,11 @@ pub fn on_mbutton_up(app: &mut Application, x: i32, y: i32) {
 }
 
 pub fn on_mousewheel(app: &mut Application, delta: i32) {
+    // 对话框/设置面板是模态的：滚轮不许穿透，否则面板后面的列表
+    // 悄悄翻页，关掉面板才发现位置早变了。
+    if app.dialog.is_some() || app.settings_open {
+        return;
+    }
     // 标签栏上滚动切标签（对应 mousewheel_switchtab）
     if app.cfg.settings.mousewheel_switchtab {
         let over_tabs = app.mouse_y < app.layout.tabstrip.bottom
@@ -1973,8 +1979,12 @@ pub fn on_mousewheel(app: &mut Application, delta: i32) {
 }
 
 pub fn on_hwheel(app: &mut Application, delta: i32) {
-    // 横向滚轮：文件视图横向滚动（图标模式暂不支持，忽略）
-    let _ = (app, delta);
+    // 横向滚轮/触控板横滑：网格是纵向排布，横向输入直接转成纵向滚动，
+    // 方向与触控板习惯一致（右滑 = 内容向左移 = 往下看）。
+    if app.dialog.is_some() || app.settings_open {
+        return;
+    }
+    app.scroll_view(if delta > 0 { 3 } else { -3 });
 }
 
 /// 跟踪键状态（Ctrl/Shift），供选择逻辑使用。
@@ -2010,6 +2020,20 @@ pub fn on_key_down(app: &mut Application, vk_raw: usize) -> bool {
             return true;
         }
         // 对话框不吃这个键时也不往下传——否则打字会顺手触发主界面的快捷键
+        return false;
+    }
+
+    // 设置面板同样是模态的。不拦的话 Delete 会删到被面板遮住的文件、
+    // Ctrl+A 在看不见的列表里全选——键盘必须像鼠标一样被面板挡住。
+    // Esc 关面板已在下面的 on_edit_key 之外单独处理，这里放行它。
+    if app.settings_open {
+        if vk == VK_ESCAPE {
+            app.settings_open = false;
+            app.flush_pending_fs_refresh();
+            app.request_repaint();
+            return true;
+        }
+        // 滚动面板自身交给方向键翻页
         return false;
     }
 
@@ -2231,6 +2255,7 @@ fn on_edit_key(app: &mut Application, vk: u16) -> bool {
             // 设置面板优先——它是模态的，ESC 先关它
             if app.settings_open {
                 app.settings_open = false;
+                app.flush_pending_fs_refresh();
                 app.request_repaint();
                 return true;
             }
@@ -2329,7 +2354,7 @@ pub fn on_char(app: &mut Application, ch: char) {
         super::dialog::char_input(app, ch);
         return;
     }
-    if app.address_editing || app.search_focused {
+    if app.address_editing || app.search_focused || app.rename_active() {
         if !ch.is_control() {
             app.edit_insert(ch);
         }

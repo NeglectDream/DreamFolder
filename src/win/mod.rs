@@ -9,6 +9,7 @@ pub mod wnd;
 pub mod dragdrop;
 pub mod droptarget;
 pub mod shellmenu;
+pub mod shellnew;
 pub mod search;
 pub mod gdiplus;
 pub mod appicon;

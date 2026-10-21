@@ -8,10 +8,17 @@
 use std::ffi::c_void;
 
 use windows_sys::core::GUID;
-use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows_sys::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+};
 
 type Hr = i32;
 const S_OK: Hr = 0;
+const S_FALSE: Hr = 1;
+/// `CoInitializeEx` 的单元类型。后台线程没有消息泵，只能用 MTA。
+const COINIT_MULTITHREADED: u32 = 0x0;
+/// 线程已经被初始化成另一种单元。
+const RPC_E_CHANGED_MODE: Hr = 0x8001_0106u32 as Hr;
 
 // ---------------------------------------------------------------- GUID 常量
 
@@ -169,71 +176,71 @@ pub fn search_index(scope: &str, key: &str, limit: usize) -> Result<Vec<Hit>, St
     if key.is_empty() || scope.is_empty() {
         return Ok(Vec::new());
     }
-    match search_once(scope, key, limit.max(1)) {
-        Ok(hits) => Ok(hits),
-        Err(err) => {
-            // 复用的数据源可能已经失效（索引服务重启过、COM 被卸载）：
-            // 丢掉缓存重建一次再试。最坏情况与「每次重建连接」等价，
-            // 所以这个降级不会比原来更差。
-            drop_source();
-            search_once(scope, key, limit.max(1)).map_err(|_| err)
+    // COM 是按线程算的。UI 线程的 `OleInitialize` 管不到这里——搜索跑在
+    // `io::Job` 现开的线程上，不就地初始化的话 `CoCreateInstance` 直接回
+    // `CO_E_NOTINITIALIZED`，搜索会永远悄悄退回本地遍历。
+    let _com = ComScope::enter()?;
+    search_once(scope, key, limit.max(1))
+}
+
+/// 一次调用的 COM 单元守卫。
+struct ComScope {
+    /// 是否该由我们配对 `CoUninitialize`。
+    uninit: bool,
+}
+
+impl ComScope {
+    fn enter() -> Result<ComScope, String> {
+        let hr = unsafe { CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED) };
+        // 每次成功的初始化（含「本来就初始化过」的 S_FALSE）都要配对收尾
+        if hr == S_OK || hr == S_FALSE {
+            Ok(ComScope { uninit: true })
+        } else if hr == RPC_E_CHANGED_MODE {
+            // 线程已被别处初始化成 STA：照用，但不该由我们收尾
+            Ok(ComScope { uninit: false })
+        } else {
+            Err(format!("搜索线程无法初始化 COM (0x{:08X})", hr as u32))
         }
     }
 }
 
-thread_local! {
-    /// 复用的搜索数据源。
-    ///
-    /// 搜索跑在后台 IO 线程上（`io::Job::Search`），线程是固定的一个，
-    /// 所以 `Search.CollatorDSO` 的数据源可以留着复用：以前每次搜索都要
-    /// `CoCreateInstance` + `Initialize` 走一遍，索引服务忙时要几十毫秒。
-    static SOURCE: std::cell::RefCell<Option<SourceHandle>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// 数据源句柄的 RAII 包装：线程退出时释放。
-struct SourceHandle(*mut c_void);
-
-impl Drop for SourceHandle {
+impl Drop for ComScope {
     fn drop(&mut self) {
-        unsafe { release(self.0) };
+        if self.uninit {
+            unsafe { CoUninitialize() };
+        }
     }
 }
 
-fn drop_source() {
-    SOURCE.with(|cell| *cell.borrow_mut() = None);
-}
-
-/// 用（必要时新建的）数据源跑一次查询。
+/// 建数据源 → 建会话 → 建命令 → 执行 → 读行集。
+///
+/// 数据源用完即释放、不跨调用缓存：`io::Job` 每个 job 都开一条新线程，
+/// 线程本地缓存在下一次搜索时必然已经销毁，留着只会让释放动作发生在
+/// `CoUninitialize` 之后（悬空到已关闭的单元里）。
 fn search_once(scope: &str, key: &str, limit: usize) -> Result<Vec<Hit>, String> {
-    SOURCE.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        if guard.is_none() {
-            let init = unsafe {
-                let mut init: *mut c_void = std::ptr::null_mut();
-                let hr = CoCreateInstance(
-                    &CLSID_COLLATOR_DSO,
-                    std::ptr::null_mut(),
-                    CLSCTX_INPROC_SERVER,
-                    &IID_IDB_INITIALIZE,
-                    &mut init,
-                );
-                if hr != S_OK || init.is_null() {
-                    return Err(format!("无法创建搜索数据源 (0x{:08X})", hr as u32));
-                }
-                // IDBInitialize::Initialize() —— 每个数据源只做一次
-                let f_init: unsafe extern "system" fn(*mut c_void) -> Hr = slot(init, 3);
-                if f_init(init) != S_OK {
-                    release(init);
-                    return Err("搜索数据源初始化失败".into());
-                }
-                init
-            };
-            *guard = Some(SourceHandle(init));
+    let init = unsafe {
+        let mut init: *mut c_void = std::ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_COLLATOR_DSO,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_IDB_INITIALIZE,
+            &mut init,
+        );
+        if hr != S_OK || init.is_null() {
+            return Err(format!("无法创建搜索数据源 (0x{:08X})", hr as u32));
         }
-        let init = guard.as_ref().map(|s| s.0).unwrap_or(std::ptr::null_mut());
-        unsafe { search_with(init, scope, key, limit) }
-    })
+        // IDBInitialize::Initialize()
+        let f_init: unsafe extern "system" fn(*mut c_void) -> Hr = slot(init, 3);
+        if f_init(init) != S_OK {
+            release(init);
+            return Err("搜索数据源初始化失败".into());
+        }
+        init
+    };
+    let out = unsafe { search_with(init, scope, key, limit) };
+    unsafe { release(init) };
+    out
 }
 
 /// 在已初始化的数据源上跑一次查询：建会话 → 建命令 → 执行 → 读行集。
@@ -249,18 +256,40 @@ unsafe fn search_with(
         return Err("搜索数据源不支持 IDBCreateSession".into());
     }
     let mut cmd_create: *mut c_void = std::ptr::null_mut();
-    let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> Hr =
-        slot(session, 3);
-    let hr = f(session, &IID_IDB_CREATE_COMMAND, &mut cmd_create);
+    // IDBCreateSession::CreateSession(pUnkOuter, riid, ppDBSession)
+    // 第 2 个参数是聚合用的 pUnkOuter，不能省——省掉的话 riid 会被填进
+    // pUnkOuter，Shell 直接回 CLASS_E_NOAGGREGATION，整条搜索链断在这里。
+    let f: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> Hr = slot(session, 3);
+    let hr = f(
+        session,
+        std::ptr::null_mut(),
+        &IID_IDB_CREATE_COMMAND,
+        &mut cmd_create,
+    );
     release(session);
     if hr != S_OK || cmd_create.is_null() {
         return Err(format!("搜索会话创建失败 (0x{:08X})", hr as u32));
     }
 
     let mut cmd_text: *mut c_void = std::ptr::null_mut();
-    let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> Hr =
-        slot(cmd_create, 3);
-    let hr = f(cmd_create, &IID_I_COMMAND_TEXT, &mut cmd_text);
+    // IDBCreateCommand::CreateCommand(pUnkOuter, riid, ppCommand)，同上。
+    let f: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> Hr = slot(cmd_create, 3);
+    let hr = f(
+        cmd_create,
+        std::ptr::null_mut(),
+        &IID_I_COMMAND_TEXT,
+        &mut cmd_text,
+    );
     release(cmd_create);
     if hr != S_OK || cmd_text.is_null() {
         return Err(format!("搜索命令创建失败 (0x{:08X})", hr as u32));
@@ -269,8 +298,11 @@ unsafe fn search_with(
     // ---- 3) 写 SQL
     let sql = build_sql(scope, key, limit);
     let sql_w: Vec<u16> = sql.encode_utf16().chain(std::iter::once(0)).collect();
+    // ICommandText 继承 ICommand，槽位接在后面：
+    // 3=GetDBSession 4=Execute 5=SetCommandText 6=GetCommandText。
+    // 写成 4 会拿着 SetCommandText 的签名去调 Execute（参数整体错位一格）。
     let f: unsafe extern "system" fn(*mut c_void, *const GUID, *const u16) -> Hr =
-        slot(cmd_text, 4);
+        slot(cmd_text, 5);
     let hr = f(cmd_text, &DBGUID_DEFAULT, sql_w.as_ptr());
     if hr != S_OK {
         release(cmd_text);

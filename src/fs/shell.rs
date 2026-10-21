@@ -198,6 +198,7 @@ pub fn set_clipboard_files(paths: &[std::path::PathBuf]) -> bool {
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
+    use windows_sys::Win32::Foundation::GlobalFree;
     use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows_sys::Win32::System::Ole::CF_HDROP;
 
@@ -225,7 +226,15 @@ pub fn set_clipboard_files(paths: &[std::path::PathBuf]) -> bool {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), base, payload.len());
 
         GlobalUnlock(hmem);
-        SetClipboardData(CF_HDROP as u32, hmem);
+        // SetClipboardData 成功后系统接管 hmem；失败则所有权还在我们手里，
+        // 不 GlobalFree 就是泄漏。失败还报成功更糟：用户以为复制了，
+        // 粘贴时却什么都没有。
+        let placed = SetClipboardData(CF_HDROP as u32, hmem);
+        if placed.is_null() {
+            GlobalFree(hmem);
+            CloseClipboard();
+            return false;
+        }
         CloseClipboard();
         true
     }
@@ -236,6 +245,7 @@ pub fn set_clipboard_text(text: &str) -> bool {
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
+    use windows_sys::Win32::Foundation::GlobalFree;
     use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
     /// CF_UNICODETEXT：windows-sys 把它放在 `Win32_System_Ole`，
@@ -268,7 +278,12 @@ pub fn set_clipboard_text(text: &str) -> bool {
         std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
 
         GlobalUnlock(hmem);
-        SetClipboardData(CF_UNICODETEXT, hmem);
+        let placed = SetClipboardData(CF_UNICODETEXT, hmem);
+        if placed.is_null() {
+            GlobalFree(hmem);
+            CloseClipboard();
+            return false;
+        }
         CloseClipboard();
         true
     }

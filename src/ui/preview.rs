@@ -13,10 +13,9 @@ use std::path::{Path, PathBuf};
 
 use crate::win::gdiplus::Image;
 
-/// 能预览的图片后缀（GDI+ 认识的那几种）。
-const IMAGE_EXT: [&str; 9] = [
-    "png", "jpg", "jpeg", "jpe", "bmp", "gif", "tif", "tiff", "webp",
-];
+/// 能预览的图片后缀（GDI+ 认识的那几种；GDI+ 没有 WebP 编解码器，
+/// 放进来只会一直显示「无法解码这张图片」）。
+const IMAGE_EXT: [&str; 8] = ["png", "jpg", "jpeg", "jpe", "bmp", "gif", "tif", "tiff"];
 
 /// 当作文本预览的后缀。
 const TEXT_EXT: [&str; 24] = [

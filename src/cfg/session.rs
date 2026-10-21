@@ -19,6 +19,20 @@ pub struct TabRecord {
     pub path: PathBuf,
     pub view: ViewMode,
     pub active: bool,
+    /// 标签种类。会话恢复时按种类重建：「此电脑」是空路径、回收站是
+    /// Shell 伪路径，二者都不是真实目录，只按 `is_dir()` 恢复会静默丢掉。
+    pub kind: TabKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabKind {
+    /// 普通目录。
+    #[default]
+    Dir,
+    /// 「此电脑」（空路径）。
+    Computer,
+    /// 回收站（`::{645FF040-...}`）。
+    Recycle,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,6 +104,8 @@ impl Session {
             out.push_str(view_token(t.view));
             out.push('\t');
             out.push(if t.active { '1' } else { '0' });
+            out.push('\t');
+            out.push_str(kind_token(t.kind));
             out.push_str("\r\n");
         }
         let _ = std::fs::write(Self::file(root), out);
@@ -99,16 +115,46 @@ impl Session {
 fn parse_line(line: &str) -> Option<TabRecord> {
     let mut it = line.split('\t');
     let path = it.next()?.trim();
-    if path.is_empty() {
-        return None;
+    if path.is_empty() && it.clone().next() != Some("computer") {
+        // 空路径只有显式标了 computer 才合法——裸空行不进列表
+        if path.is_empty() {
+            return None;
+        }
     }
     let view = it.next().map(parse_view).unwrap_or(ViewMode::Medium);
     let active = it.next().map(|s| s.trim() == "1").unwrap_or(false);
+    let kind = it.next().map(parse_kind).unwrap_or_else(|| {
+        // 旧格式没有第四列：按路径特征推断
+        if path.is_empty() {
+            TabKind::Computer
+        } else if path == "::{645FF040-5081-101B-9F08-00AA002F954E}" {
+            TabKind::Recycle
+        } else {
+            TabKind::Dir
+        }
+    });
     Some(TabRecord {
         path: PathBuf::from(path),
         view,
         active,
+        kind,
     })
+}
+
+fn kind_token(k: TabKind) -> &'static str {
+    match k {
+        TabKind::Dir => "dir",
+        TabKind::Computer => "computer",
+        TabKind::Recycle => "recycle",
+    }
+}
+
+fn parse_kind(s: &str) -> TabKind {
+    match s.trim() {
+        "computer" => TabKind::Computer,
+        "recycle" => TabKind::Recycle,
+        _ => TabKind::Dir,
+    }
 }
 
 fn view_token(v: ViewMode) -> &'static str {

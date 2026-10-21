@@ -131,14 +131,16 @@ pub fn scale_slider_rect(app: &Application, i: usize) -> RECT {
     rect(left, cy - half, right, cy + half)
 }
 
-/// 轨道本身：两端各留一个滑块半径，滑块拖到两端时仍完整落在轨道内。
+/// 轨道本身：两端各留半个滑块宽，滑块拖到两端时仍完整落在轨道内。
 pub fn scale_track_rect(app: &Application, i: usize) -> RECT {
     let s = |v: i32| (v as f32 * app.layout.scale).round() as i32;
     let a = scale_slider_rect(app, i);
     let cy = (a.top + a.bottom) / 2;
-    let radius = s(7);
+    // 滑块是 3dp 的方形竖条（不是圆钮），两端只要留半条宽就够；
+    // 留成一个半径的余量会在轨道两头留下两段「拖到底也填不满」的空隙。
+    let inset = s(2);
     let half_h = s(2).max(2);
-    rect(a.left + radius, cy - half_h, a.right - radius, cy + half_h)
+    rect(a.left + inset, cy - half_h, a.right - inset, cy + half_h)
 }
 
 /// 当前缩放值对应的滑块中心 x。

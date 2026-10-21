@@ -46,7 +46,9 @@ fn parse_meta(bytes: &[u8]) -> Option<(PathBuf, u64, u64)> {
     let deleted = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
     let name_len = u32::from_le_bytes(bytes[24..28].try_into().ok()?) as usize;
     // 版本 1 的路径长度字段不可信，固定 520 字节；版本 2 才按实际长度取。
-    let name_bytes = if version == 2 { name_len } else { 520 };
+    // v2 的 name_len 是 **UTF-16 字符数**（含结尾 NUL），不是字节数——
+    // 当字节数用会把路径截半，还原时就会把文件扔进一个不存在的半截目录。
+    let name_bytes = if version == 2 { name_len * 2 } else { 520 };
     let end = (28 + name_bytes).min(bytes.len());
     let raw = &bytes[28..end];
     let units: Vec<u16> = raw
@@ -160,8 +162,13 @@ pub fn purge(data: &Path) -> Result<(), String> {
     } else {
         std::fs::remove_file(data)
     };
-    if let Some(meta) = meta {
-        let _ = std::fs::remove_file(meta);
+    // 数据删干净了才动元数据：文件被占用（正在播放的视频等）时删除会失败，
+    // 若照样删 `$I`，条目从列表消失、`$R` 残留占空间，而且再也无法通过
+    // 界面删它——枚举只认 `$I`。留着元数据，用户还能再试一次。
+    if res.is_ok() {
+        if let Some(meta) = meta {
+            let _ = std::fs::remove_file(meta);
+        }
     }
     res.map_err(|e| format!("{}: {e}", data.display()))
 }
@@ -206,4 +213,59 @@ fn unique_target(p: &Path) -> PathBuf {
         }
     }
     p.with_file_name(format!("{stem} (还原){ext}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一个 v2 版 `$I` 的字节布局。
+    fn v2_meta(path: &str, size: u64, deleted: u64) -> Vec<u8> {
+        let units: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut b = Vec::new();
+        b.extend_from_slice(&2u64.to_le_bytes()); // 版本
+        b.extend_from_slice(&size.to_le_bytes());
+        b.extend_from_slice(&deleted.to_le_bytes());
+        // namelen 字段：字符数（含 NUL），与系统写盘口径一致
+        b.extend_from_slice(&(units.len() as u32).to_le_bytes());
+        for u in units {
+            b.extend_from_slice(&u.to_le_bytes());
+        }
+        b
+    }
+
+    /// `$I` v2 的 namelen 是 UTF-16 字符数而非字节数。
+    ///
+    /// 拿真实 `$I` 文件实证过：namelen=47（字符），名字区 94 字节。
+    /// 旧代码按字节取，中文路径被截到一半，「原位置」列显示半截，
+    /// 还原时 `create_dir_all` 会造出一个乱码目录。
+    #[test]
+    fn v2_namelen_is_utf16_units_not_bytes() {
+        let orig = r"C:\Users\小明\Downloads\报告文档 v3.docx";
+        let bytes = v2_meta(orig, 12345, 67890);
+        let (path, size, deleted) = parse_meta(&bytes).expect("v2 元数据应能解析");
+        assert_eq!(path, PathBuf::from(orig));
+        assert_eq!(size, 12345);
+        assert_eq!(deleted, 67890);
+    }
+
+    /// v1（固定 520 字节名字区）的解析不受影响。
+    #[test]
+    fn v1_fixed_name_area_still_works() {
+        let orig = r"C:\old\a.txt";
+        let units: Vec<u16> = orig.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&7u64.to_le_bytes());
+        b.extend_from_slice(&9u64.to_le_bytes());
+        b.extend_from_slice(&(units.len() as u32).to_le_bytes());
+        b.extend_from_slice(&units.iter().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>());
+        // 补齐到 28+520，与 Win9x-era 布局一致
+        while b.len() < 28 + 520 {
+            b.push(0);
+        }
+        let (path, size, _) = parse_meta(&b).expect("v1 元数据应能解析");
+        assert_eq!(path, PathBuf::from(orig));
+        assert_eq!(size, 7);
+    }
 }

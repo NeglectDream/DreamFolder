@@ -19,7 +19,8 @@
 
 use crate::app::CommandLine;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE,
+    CloseHandle, GetLastError, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED,
+    GENERIC_READ, GENERIC_WRITE,
     HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -192,7 +193,27 @@ impl PipeServer {
             return true;
         }
         // ERROR_IO_INCOMPLETE：仍在等客户端，这是常态而非错误
+        if unsafe { GetLastError() } != ERROR_IO_INCOMPLETE {
+            // 等待以其它错误收场（客户端连上又立刻断开等）：重挂一次，
+            // 服务端别就此僵死——僵死后客户端只能各开各的新进程。
+            self.connect_pending = false;
+            self.start_connect();
+        }
         false
+    }
+
+    /// 处理完一条报文后复位，准备接下一个客户端。
+    ///
+    /// 以前处理完一条就不再复位：`connected` 恒为 true，第二次唤起
+    /// 投递成功之后管道就死在那里，第三次唤起的客户端拿到
+    /// `ERROR_PIPE_BUSY`，误判成「没有服务端」，于是再启动一个完整进程。
+    pub fn recycle(&mut self) {
+        unsafe {
+            DisconnectNamedPipe(self.handle);
+        }
+        self.connected = false;
+        self.connect_pending = false;
+        self.start_connect();
     }
 
     /// 读取一条报文。返回 None 表示当前没有数据。

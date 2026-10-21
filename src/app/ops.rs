@@ -369,11 +369,21 @@ impl Application {
         }
     }
 
+    /// 在活动标签里选中一个路径。列表还没加载到它时先记账
+    /// （`pending_select`），枚举落地后由 `on_io` 补选中。
     pub(crate) fn select_by_path(&mut self, path: &std::path::Path) {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let Some(idx) = self
             .active()
             .and_then(|t| t.entries.iter().position(|e| e.full == path))
         else {
+            // 新建项要等刷新落地才出现在列表里；异步枚举期间条目还是空的
+            if let Some(t) = self.active_mut() {
+                t.pending_select = (!name.is_empty()).then_some(name);
+            }
             return;
         };
         self.select_entry(idx, false, false);

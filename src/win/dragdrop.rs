@@ -144,9 +144,9 @@ unsafe fn free_pidls(pidls: &[*mut ITEMIDLIST]) {
 /// 调用方通常在同线程处理 `WM_LBUTTONDOWN` 之后、移动超过拖拽阈值时调用它。
 /// `allow_move` 为 false 时只允许复制和建快捷方式，用于只读位置。
 ///
-/// 返回坐标是为了让调用方判断「是否落在自己的收藏栏上」——拖到本进程自己的
-/// 控件上时 OLE 不会给我们 Drop 回调（没注册 IDropTarget），所以只能事后
-/// 按落点判定。
+/// 返回坐标是为了让调用方判断「是否落在自己的收藏栏上」。窗口虽然已经
+/// 注册了 `IDropTarget`，但落点判定有两套：OLE 回调给的客户端坐标
+/// （`WM_DREAMFOLDER_DROP`）和这里事后取的屏幕坐标，两条路都要能走通。
 pub fn start(paths: &[PathBuf], allow_move: bool) -> Option<(i32, i32)> {
     if paths.is_empty() {
         return None;
@@ -216,9 +216,9 @@ pub fn start(paths: &[PathBuf], allow_move: bool) -> Option<(i32, i32)> {
 
         // 放下时的光标位置（屏幕坐标）：调用方用它判断是不是落在自己的收藏栏上。
         //
-        // 注意这里**不按 `hr` 提前返回**：拖到本进程自己的控件上时，那个位置
-        // 没有注册 IDropTarget，OLE 认定「没有目标接受」，返回的是
-        // DRAGDROP_S_CANCEL 而不是 S_DROP。按返回值过滤的话，收藏栏永远不会生效。
+        // 注意这里**不按 `hr` 提前返回**：落回自己的窗口时，`Drop` 回调已经
+        // 通过 `WM_DREAMFOLDER_DROP` 把落点送过去了，但别的目标（含
+        // `DRAGDROP_S_CANCEL` 的中途取消）仍需要靠这个坐标兜底判定。
         let mut pt = POINT { x: 0, y: 0 };
         if GetCursorPos(&mut pt) == 0 {
             return None;

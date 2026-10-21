@@ -79,7 +79,8 @@ pub struct Image {
 }
 
 impl Image {
-    /// 从磁盘文件解码。支持 GDI+ 认识的一切格式（PNG/JPEG/BMP/GIF/TIFF/WEBP…）。
+    /// 从磁盘文件解码。支持 GDI+ 认识的格式（PNG/JPEG/BMP/GIF/TIFF/ICO）。
+    /// 不含 WebP：GDI+ 内置编解码器没有它，传进去必然失败。
     pub fn load(path: &Path) -> Option<Image> {
         if !ensure_init() {
             return None;

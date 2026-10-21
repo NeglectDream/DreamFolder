@@ -76,6 +76,7 @@ use super::*;
                 t.search_backup = Some(b);
             }
             t.search_state = Some(SearchState::Running);
+            t.search_id = id;
         }
         self.arm_search_timeout();
         self.request_repaint();
@@ -141,5 +142,32 @@ use super::*;
             t.scroll_y = 0;
         }
         self.request_repaint();
-}
+    }
+
+    /// 当前标签是不是正停在搜索结果上（列表已被命中项替换）。
+    ///
+    /// 只看 `search_backup`：它恰好等价于「列表已经不是真实目录内容」。
+    /// 只输了词还没回车时备份为空，此时列表仍是真目录，不该算搜索视图。
+    pub(crate) fn in_search_view(&self) -> bool {
+        self.active().map(|t| t.search_backup.is_some()).unwrap_or(false)
+    }
+
+    /// 搜索视图下退出搜索，返回是否真的退出了。
+    ///
+    /// 搜索不改标签路径，所以「上一级」「后退」这类按路径走的导航会从
+    /// 「`D:\A\B` 的搜索结果」一步跳到 `D:\A`——搜索起点 `D:\A\B` 本身
+    /// 被整个跳过，用户再想回去得手动点进来。这里把「退出搜索」当成一次
+    /// 真实的导航来消化：先回到起点列表，用户再按一次才真的往上走。
+    pub(crate) fn leave_search_view(&mut self) -> bool {
+        if !self.in_search_view() {
+            return false;
+        }
+        self.restore_search_backup();
+        let t = self.cur_mut();
+        t.search_text.clear();
+        t.search_caret = 0;
+        t.search_state = None;
+        self.request_repaint();
+        true
+    }
 }

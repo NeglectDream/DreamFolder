@@ -6,7 +6,7 @@
 //! 冷启动相关：`BackBuffer` 是**懒创建**的——首次 WM_PAINT 才分配 GDI 资源，
 //! 首帧之前不消耗任何句柄。
 
-use windows_sys::Win32::Foundation::{COLORREF, RECT, SIZE};
+use windows_sys::Win32::Foundation::{RECT, SIZE};
 // Gdi 通配同时提供 BeginPaint / EndPaint / PAINTSTRUCT / DrawTextW / CreateFontW 等
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL, HICON};
@@ -25,9 +25,6 @@ thread_local! {
     /// 对象创建、用完再 `DeleteObject` 销毁，纯属浪费。画刷是进程级对象，
     /// 可以跨 DC、跨帧一直复用。
     static SOLID_BRUSHES: std::cell::RefCell<std::collections::HashMap<u32, HBRUSH>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-    /// 纯色画笔缓存。理由同上，`round_fill` 每次都要一支。
-    static SOLID_PENS: std::cell::RefCell<std::collections::HashMap<u32, HPEN>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -50,26 +47,14 @@ fn solid_brush(color: u32) -> HBRUSH {
     })
 }
 
-fn solid_pen(color: u32) -> HPEN {
-    SOLID_PENS.with(|cell| {
-        let mut map = cell.borrow_mut();
-        if let Some(&h) = map.get(&color) {
-            return h;
-        }
-        if map.len() >= SOLID_CACHE_MAX {
-            for (_, h) in map.drain() {
-                unsafe {
-                    DeleteObject(h);
-                }
-            }
-        }
-        let h = unsafe { CreatePen(PS_SOLID, 1, color) };
-        map.insert(color, h);
-        h
-    })
-}
 
-/// 界面配色。与 360FileBrowser_Theme.ui 中的十六进制色值一一对应。
+/// 界面配色。
+///
+/// 一套语义 token 服务两套主题：功能指到哪，颜色就跟着走到哪。
+/// 强调色（`accent`）承载四种「当前」语义——激活标签、选中行、焦点框、
+/// 排序列——它们必须是同一个颜色，否则「当前在哪」要靠猜。
+///
+/// 全部为 GDI 的 `COLORREF`（`0x00BBGGRR`），不是 `#RRGGBB`。
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub window_bg: u32,
@@ -77,19 +62,31 @@ pub struct Palette {
     pub tab_active: u32,
     pub tab_inactive: u32,
     pub text: u32,
+    /// 更重的正文色：标题、选中项文字、表头。比 `text` 深/亮一档。
+    pub text_strong: u32,
     pub text_dim: u32,
     pub text_on_accent: u32,
     pub accent: u32,
+    /// 强调色的淡底：选中行、激活区背景。浅浅一层，文字仍然压得住。
+    pub accent_soft: u32,
+    /// 强调色的描边：焦点框、选中项左标记。
+    pub accent_border: u32,
     pub toolbar_bg: u32,
     pub nav_bg: u32,
     pub border: u32,
     pub border_light: u32,
+    /// 面板之间的硬分隔线（比 `border` 明显一档，用来切结构）。
+    pub divider: u32,
     pub address_bg: u32,
     pub address_border: u32,
     pub list_bg: u32,
     pub item_hover: u32,
     pub item_selected: u32,
     pub item_selected_inactive: u32,
+    /// 详细信息视图的斑马纹（偶数行）。极轻，只用来防串行。
+    pub row_alt: u32,
+    /// 表格的列分隔竖线。
+    pub grid_line: u32,
     pub header_bg: u32,
     /// 悬停底色：标签页与标题栏按钮（菜单/最小化/最大化/关闭）共用这一个值。
     ///
@@ -117,83 +114,125 @@ pub struct Palette {
     /// 滚动条滑块。刻意用很浅的灰：它只是一条提示「还能往下翻」的小滑块，
     /// 不该像内容一样抢眼睛（深色主题下同理，用深灰而不是浅灰）。
     pub scroll_thumb: u32,
+    /// 状态栏底色。比工具栏再沉一点，让底部成为真正的「托盘」。
+    pub statusbar_bg: u32,
+    /// 标签胶囊/详情 chips 的底与描边（详情窗格的标签色块）。
+    pub chip_bg: u32,
+    pub chip_border: u32,
+    /// 设置面板里「关」状态的开关底。开状态直接用 `accent`。
+    pub toggle_off: u32,
+    /// 滑块的轨道。已填充部分用 `accent`。
+    pub slider_track: u32,
+    /// 图标主色与次要图标色（工具按钮、导航箭头）。
+    pub icon: u32,
+    pub icon_dim: u32,
 }
 
 impl Palette {
-    /// 浅色主题：取自 360FileBrowser_Theme.ui 的实际色值。
+    /// 浅色主题：纸白底 + 冷灰分层 + 单一强调蓝。
+    ///
+    /// 分三层：内容（最白）→ 工具栏（微灰）→ 导航/表头（再深一点）。
+    /// 层级靠亮度差表达，不靠圆角和阴影——直角 + 1px 硬边就是这个主题的骨架。
     pub const LIGHT: Palette = Palette {
         window_bg: 0x00FF_FFFF,
-        titlebar_bg: 0x00F3_F3F3,
+        titlebar_bg: 0x00F7_F5F4,
         tab_active: 0x00FF_FFFF,
-        tab_inactive: 0x00F3_F3F3,
-        text: 0x00_1B_1B1B,
-        text_dim: 0x00_76_7676,
+        tab_inactive: 0x00F7_F5F4,
+        text: 0x00_1D_1816,
+        text_strong: 0x00_12_0D0B,
+        text_dim: 0x00_85_7768,
         text_on_accent: 0x00FF_FFFF,
-        // 资源管理器的强调蓝（Win11 #0067C0），不再用品牌橙。
-        // 注意字面量是 COLORREF `0x00BBGGRR`：这里写成 0x00C06700 才渲染成 #0067C0。
-        accent: 0x00_C0_6700,
-        toolbar_bg: 0x00FF_FFFF,
-        nav_bg: 0x00FF_FFFF,
-        border: 0x00_E5_E5E5,
-        border_light: 0x00_F0_F0F0,
+        // 强调蓝 #0B6BCB：比资源管理器的 #0067C0 更冷、更饱和一分，
+        // 在白底上压得住，也能和深色主题的青蓝形成同一族。
+        accent: 0x00_CB_6B0B,
+        accent_soft: 0x00_FD_F1E8,
+        // 描边版强调蓝 #1B5FA8：比 `accent` 沉一档，做 1px 焦点框时不会
+        // 抢过实心填充，但仍然是同一个蓝——「当前在哪」永远同一个答案。
+        accent_border: 0x00_A8_5F1B,
+        toolbar_bg: 0x00_FC_FBFA,
+        nav_bg: 0x00_FA_F8F7,
+        border: 0x00_EB_E6E2,
+        border_light: 0x00_F3_F0ED,
+        divider: 0x00_E4_DDD8,
         address_bg: 0x00FF_FFFF,
-        address_border: 0x00_CC_CCCC,
+        address_border: 0x00_DA_D2CB,
         list_bg: 0x00FF_FFFF,
-        // 注意：这些常量是 GDI 的 `COLORREF`（0x00BBGGRR），不是 `#RRGGBB`。
-        // 以前按 `#RRGGBB` 写，红色和蓝色是反的——浅色模式里选中行会显示成
-        // 橙色蒙版，而不是资源管理器那块浅蓝。
-        item_hover: 0x00FC_F3_EA,
-        // 选中态＝资源管理器那块浅蓝（#CCE8FF），GDI 纯色填充不支持 alpha，预先混合成实色
-        item_selected: 0x00FF_E8_CC,
-        item_selected_inactive: 0x00F2_F2F2,
-        header_bg: 0x00FA_FA_FA,
-        button_hover: 0x00_E0_E0E0,
-        button_pushed: 0x00_CC_CCCC,
-        progress_track: 0x00E0_E0E0,
-        progress_fill: 0x00_C0_6700,
-        progress_low: 0x00_23_11E8,
-        marquee_border: 0x00_C0_6700,
-        marquee_fill: 0x00_F0_C99C,
-        scroll_thumb: 0x00_C8_C8C8,
+        item_hover: 0x00_F8_F4F1,
+        // 选中态＝强调色的淡底，与激活标签、焦点框同一族
+        item_selected: 0x00_FB_EEE3,
+        item_selected_inactive: 0x00_F4_F0ED,
+        row_alt: 0x00_FE_FCFA,
+        grid_line: 0x00_F3_F0ED,
+        header_bg: 0x00_F7_F4F2,
+        button_hover: 0x00_F1_ECE8,
+        button_pushed: 0x00_E4_DCD6,
+        progress_track: 0x00_EB_E6E2,
+        progress_fill: 0x00_CB_6B0B,
+        progress_low: 0x00_25_30D9,
+        marquee_border: 0x00_CB_6B0B,
+        marquee_fill: 0x00_FA_E7D6,
+        scroll_thumb: 0x00_D4_CBC4,
+        statusbar_bg: 0x00_F7_F5F4,
+        chip_bg: 0x00_F7_F2EE,
+        chip_border: 0x00_EB_E3DC,
+        toggle_off: 0x00_D4_CBC4,
+        slider_track: 0x00_EB_E6E2,
+        icon: 0x00_54_4B44,
+        icon_dim: 0x00_9E_938A,
     };
 
-    /// 深色主题：取自 360FileBrowser_BlackTheme.ui，底部一层做了修正。
+    /// 深色主题：石墨底 + 亮度分层 + 青蓝强调。
     ///
     /// 底色不用纯黑：非 OLED 屏（LCD/IPS）根本显示不出 #000000，
     /// 纯黑在那些屏上会发灰、出现色带，且与 UI 里的深灰控件拉不开层次。
-    /// 这里统一抬到 #202020，视觉上仍然是深色，但不依赖面板能不能做到全黑。
+    /// 这里统一抬到 #1B1D21，视觉上仍然是深色，但不依赖面板能不能做到全黑。
     pub const DARK: Palette = Palette {
-        window_bg: 0x00_20_2020,
-        titlebar_bg: 0x00_2B_2B2B,
-        tab_active: 0x00_20_2020,
-        tab_inactive: 0x00_2B_2B2B,
-        text: 0x00FB_FB_FB,
-        text_dim: 0x00_9D_9D9D,
-        text_on_accent: 0x00FF_FFFF,
-        accent: 0x00_FF_C24C, // #4CC2FF
-        toolbar_bg: 0x00_2B_2B2B,
-        nav_bg: 0x00_25_2525,
-        border: 0x00_3D_3D3D,
-        border_light: 0x00_33_3333,
-        address_bg: 0x00_2D_2D2D,
-        address_border: 0x00_45_4545,
-        list_bg: 0x00_20_2020,
-        item_hover: 0x00_2E_2E2E,
-        // 选中态＝叠在 #202020 上的一层白色 15% 遮罩（预先混合成实色）。
-        // 这就是 Win11 深色资源管理器的选中观感：提亮，而不是染色。
-        item_selected: 0x00_41_4141,
-        item_selected_inactive: 0x00_36_3636,
-        header_bg: 0x00_28_28_28,
-        button_hover: 0x00_40_4040,
-        button_pushed: 0x00_52_5252,
-        progress_track: 0x00_3A_3A3A,
-        progress_fill: 0x00_FF_C24C,
-        progress_low: 0x00_4A_4AE0,
-        marquee_border: 0x00_D9_9A4C,
-        marquee_fill: 0x00_8A_5F2A,
-        scroll_thumb: 0x00_4A_4A4A,
+        window_bg: 0x00_21_1D1B,
+        titlebar_bg: 0x00_2C_2724,
+        tab_active: 0x00_21_1D1B,
+        tab_inactive: 0x00_2C_2724,
+        text: 0x00_F0_EAE6,
+        text_strong: 0x00_FF_FFFF,
+        text_dim: 0x00_AE_A298,
+        text_on_accent: 0x00_21_1D1B,
+        // 强调青蓝 #58A6FF：深底上亮度足够，做选中底也不会刺眼
+        accent: 0x00_FF_A658,
+        accent_soft: 0x00_38_2A1E,
+        // 描边版强调蓝 #4A8CD9：在深底上要压得住底色，又不能亮到跟
+        // 实心 `accent` 混淆——描边读「边界」，填充读「整块」。
+        accent_border: 0x00_D9_8C4A,
+        toolbar_bg: 0x00_2A_2522,
+        nav_bg: 0x00_26_211E,
+        border: 0x00_40_3733,
+        border_light: 0x00_35_2E2A,
+        divider: 0x00_4C_423D,
+        address_bg: 0x00_30_2A26,
+        address_border: 0x00_53_4741,
+        list_bg: 0x00_21_1D1B,
+        item_hover: 0x00_32_2B27,
+        item_selected: 0x00_49_3422,
+        item_selected_inactive: 0x00_36_2E2A,
+        row_alt: 0x00_26_211E,
+        grid_line: 0x00_35_2E2A,
+        header_bg: 0x00_2B_2623,
+        button_hover: 0x00_3E_3631,
+        button_pushed: 0x00_4C_423C,
+        progress_track: 0x00_40_3733,
+        progress_fill: 0x00_FF_A658,
+        progress_low: 0x00_5E_6BF2,
+        marquee_border: 0x00_FF_A658,
+        marquee_fill: 0x00_5E_4023,
+        scroll_thumb: 0x00_51_4741,
+        statusbar_bg: 0x00_2A_2522,
+        chip_bg: 0x00_32_2B27,
+        chip_border: 0x00_4A_403A,
+        toggle_off: 0x00_55_4B45,
+        slider_track: 0x00_40_3733,
+        icon: 0x00_C4_B8AE,
+        icon_dim: 0x00_86_796F,
     };
 }
+
 
 /// 离屏画布。所有绘制都先落在内存位图上，最后一次 BitBlt 上屏。
 pub struct BackBuffer {
@@ -240,12 +279,18 @@ impl BackBuffer {
         }
     }
 
+    /// 把离屏位图的一块贴到屏幕。
+    ///
+    /// 源坐标必须和目标坐标一致：离屏位图与客户区一一对应，只传脏区时
+    /// 要从位图的同一位置取。这里曾经写死源 `(0, 0)`，等于把位图左上角
+    /// 那一块贴到脏区上——局部重绘（插入符闪烁、拖动高亮）于是把标签栏
+    /// 的内容搬到地址栏和导航窗格的位置，看起来就是「错位」。
     pub fn blit_to(&self, dst: HDC, x: i32, y: i32, w: i32, h: i32) {
         if self.mem_dc.is_null() {
             return;
         }
         unsafe {
-            BitBlt(dst, x, y, w, h, self.mem_dc, 0, 0, SRCCOPY);
+            BitBlt(dst, x, y, w, h, self.mem_dc, x, y, SRCCOPY);
         }
     }
 }
@@ -331,65 +376,6 @@ impl Canvas {
         self.hline(r.left, r.right, r.bottom - 1, color);
         self.vline(r.left, r.top, r.bottom, color);
         self.vline(r.right - 1, r.top, r.bottom, color);
-    }
-
-    /// 圆角填充（圆角矩形按钮/输入框）。
-    /// 填充一个矩形（可选 1px 边框）。
-    ///
-    /// 名字里的 `round` 是历史遗留：早期这套 UI 跟原软件一样是圆角风格，
-    /// `radius` 参数还在签名里，但现在**一律按直角绘制**——整体视觉已改为
-    /// 方正的资源管理器风格，圆角反而成了噪音。
-    pub fn round_fill(&self, r: RECT, radius: i32, fill_color: u32, border_color: Option<u32>) {
-        let _ = radius;
-        // 画刷/画笔都走缓存：它们的销毁由缓存负责，这里不能 DeleteObject，
-        // 否则下一次命中缓存就拿到一个已释放的句柄。
-        let brush = solid_brush(fill_color);
-        let pen = solid_pen(border_color.unwrap_or(fill_color));
-        unsafe {
-            let old_brush = SelectObject(self.hdc, brush);
-            let old_pen = SelectObject(self.hdc, pen);
-
-            Rectangle(self.hdc, r.left, r.top, r.right, r.bottom);
-
-            SelectObject(self.hdc, old_pen);
-            SelectObject(self.hdc, old_brush);
-        }
-    }
-
-    /// 画一个抗锯齿的实心圆。
-    ///
-    /// GDI 的 `Ellipse` 边缘是硬锯齿，20px 左右的圆看着像被啃过一圈；
-    /// 这里按「像素中心到圆心的距离」算覆盖率，跟**已知底色**混合后再逐点写入，
-    /// 边缘就有了过渡。底色必须由调用方给——回读 `GetPixel` 又慢又容易读到半成品。
-    ///
-    /// 只用在悬停指示这种几十像素的小图上，逐点开销可以忽略。
-    pub fn circle_fill(&self, cx: i32, cy: i32, radius: i32, color: u32, backdrop: u32) {
-        let radius = radius.max(1);
-        let rad = radius as f32;
-        let (fr, fg, fb) = (
-            ((color >> 16) & 0xFF) as f32,
-            ((color >> 8) & 0xFF) as f32,
-            (color & 0xFF) as f32,
-        );
-        let (br, bg, bb) = (
-            ((backdrop >> 16) & 0xFF) as f32,
-            ((backdrop >> 8) & 0xFF) as f32,
-            (backdrop & 0xFF) as f32,
-        );
-        let mix = |f: f32, b: f32, cov: f32| (b + (f - b) * cov).round().clamp(0.0, 255.0) as u32;
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                let dist = (((dx * dx + dy * dy) as f32).sqrt()).min(rad + 1.0);
-                let cov = (rad + 0.5 - dist).clamp(0.0, 1.0);
-                if cov <= 0.0 {
-                    continue;
-                }
-                let px: COLORREF = mix(fr, br, cov) << 16 | mix(fg, bg, cov) << 8 | mix(fb, bb, cov);
-                unsafe {
-                    SetPixelV(self.hdc, cx + dx, cy + dy, px);
-                }
-            }
-        }
     }
 
     /// 半透明填充一个矩形。

@@ -109,6 +109,14 @@ pub(crate) unsafe extern "system" fn wnd_proc(
             0
         }
         WM_ERASEBKGND => 1, // 背景由双缓冲覆盖，禁止系统擦除
+        // 系统右键菜单在弹的时候，子菜单要靠这些消息才会被 Shell 填出来。
+        // 不转发的话「新建」展开后一个类型都没有（详见 shellmenu 里的说明）。
+        WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM => {
+            if let Some(r) = crate::win::shellmenu::forward_menu_message(msg, wparam, lparam) {
+                return r;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_MOUSEMOVE => {
             let x = lo_word(lparam);
             let y = hi_word(lparam);
@@ -174,12 +182,17 @@ pub(crate) unsafe extern "system" fn wnd_proc(
             interact::on_hwheel(app, delta);
             0
         }
-        WM_KEYDOWN => {
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
             // Alt 状态来自 GetKeyState
             use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_MENU};
             app.modifiers.alt = (GetKeyState(VK_MENU as i32) as u16 & 0x8000) != 0;
             interact::update_modifiers(app);
             if interact::on_key_down(app, wparam) {
+                return 0;
+            }
+            // Alt 按住时系统默认会激活菜单键——消费掉，避免每按一次 Alt
+            // 就发出一声「叮」并把焦点挪到菜单栏（本程序没有菜单栏）
+            if msg == WM_SYSKEYDOWN && wparam as u16 == VK_MENU {
                 return 0;
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -199,8 +212,17 @@ pub(crate) unsafe extern "system" fn wnd_proc(
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_IME_SETCONTEXT => {
+            // 自绘窗口：组合串的位置由 `ImmSetCompositionWindow` 决定。
+            // 没有编辑框时要把 `ISC_SHOWUICOMPOSITIONWINDOW` 掐掉——否则
+            // 系统会往窗口表面画一份 UI 组合窗，位置用默认的客户区左上角，
+            // 正好压在标签栏上；中文还没上屏的那一瞬间看着就像标签栏在闪。
+            let mut lp = lparam;
+            if !app.has_text_edit() {
+                use windows_sys::Win32::UI::Input::Ime::ISC_SHOWUICOMPOSITIONWINDOW;
+                lp &= !(ISC_SHOWUICOMPOSITIONWINDOW as isize);
+            }
             app.place_ime_window(hwnd);
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            DefWindowProcW(hwnd, msg, wparam, lp)
         }
         WM_SETFOCUS => {
             app.active_tab_focused = true;
@@ -218,6 +240,10 @@ pub(crate) unsafe extern "system" fn wnd_proc(
         }
         crate::win::droptarget::WM_DREAMFOLDER_DROP => {
             app.handle_external_drop();
+            0
+        }
+        crate::win::droptarget::WM_DREAMFOLDER_DRAGOVER => {
+            app.update_drop_hover();
             0
         }
         // 后台线程干完活投过来的唤醒：把队里的结果一次取干净。
@@ -314,6 +340,11 @@ pub(crate) unsafe extern "system" fn wnd_proc(
                             ShowWindow(hwnd, SW_RESTORE);
                         }
                         SetForegroundWindow(hwnd);
+                    }
+                    // 处理完就复位管道，继续等下一个客户端。不复位的话
+                    // 下一个唤起只能再开一个新进程。
+                    if let Some(pipe) = &mut app.pipe {
+                        pipe.recycle();
                     }
                 }
             }

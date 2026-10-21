@@ -331,6 +331,17 @@ impl Application {
         self.after_edit();
     }
 
+    /// 当前是否有文本编辑框接收输入（地址栏 / 搜索框 / 重命名 / 对话框）。
+    ///
+    /// IME 与插入符闪烁都按这个判据决定行止，所以只留一份定义：
+    /// 两处各写一遍，早晚会有一边漏掉「对话框输入框」这类新形态。
+    pub fn has_text_edit(&self) -> bool {
+        self.address_editing
+            || self.search_focused
+            || self.rename_active()
+            || self.dialog.as_ref().map(|d| d.has_input()) == Some(true)
+    }
+
     /// 把 IME 的组合窗与候选窗移到当前编辑框的插入符旁。
     ///
     /// 自绘窗口没有系统编辑控件，输入法默认把候选窗摆在屏幕左上角，
@@ -346,14 +357,10 @@ impl Application {
 
         // 编辑态退出后锚点可能残留（退出点散落各处），这里消费前
         // 先确认确有编辑框激活，非编辑态不挪窗口
-        let editing = self.address_editing
-            || self.search_focused
-            || self.rename_active()
-            || self.dialog.as_ref().map(|d| d.has_input()) == Some(true);
-        if !editing {
+        if !self.has_text_edit() {
             return;
         }
-        let Some((x, y)) = self.ime_anchor else {
+        let Some((x, y)) = self.ime_anchor.or_else(|| self.ime_fallback_anchor()) else {
             return;
         };
         unsafe {
@@ -379,5 +386,33 @@ impl Application {
             ImmSetCandidateWindow(himc, &cand);
             ImmReleaseContext(hwnd, himc);
         }
+    }
+
+    /// `ime_anchor` 还没被绘制层写下时的安全落点。
+    ///
+    /// 插入符锚点是绘制时记录的，而 IME 可能在那之前就发
+    /// `WM_IME_STARTCOMPOSITION`：点进地址栏后立刻敲输入法第一个键，
+    /// 中间那一帧还没画，锚点是 `None`。以前这里直接放弃定位，系统就把
+    /// 组合窗摆到客户区左上角——正好压在标签栏上，中文还没上屏时看着
+    /// 像标签栏在闪。退到编辑控件左上角，最差也只是偏左一点。
+    fn ime_fallback_anchor(&self) -> Option<(i32, i32)> {
+        let l = &self.layout;
+        let s = |v: i32| (v as f32 * l.scale).round() as i32;
+        if self.address_editing {
+            return Some((l.address.left + s(8), l.address.top + s(6)));
+        }
+        if self.search_focused {
+            return Some((l.search.left + s(8), l.search.top + s(6)));
+        }
+        if self.dialog.as_ref().map(|d| d.has_input()) == Some(true) {
+            let p = crate::ui::dialog::parts(self);
+            return Some((p.input.left + s(8), p.input.top + s(6)));
+        }
+        if let Some(idx) = self.rename_target {
+            let t = self.active()?;
+            let r = l.item_rect(t.view_mode, idx, t.scroll_y);
+            return Some((r.left + s(8), r.top + s(4)));
+        }
+        None
     }
 }

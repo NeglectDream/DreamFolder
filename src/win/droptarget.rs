@@ -72,6 +72,21 @@ static PENDING: Mutex<Option<(DropZone, Vec<PathBuf>)>> = Mutex::new(None);
 /// 拖放内容已就绪的自定义消息（由 `drop_impl` 投递，UI 线程取出后处理）。
 pub const WM_DREAMFOLDER_DROP: u32 = WM_APP + 17;
 
+/// 拖动经过窗口时投递的消息：UI 线程据此更新「会落在哪一行」的高亮。
+pub const WM_DREAMFOLDER_DRAGOVER: u32 = WM_APP + 18;
+
+/// 拖动中最近一次的客户区落点。
+///
+/// 只有 UI 线程读它，但 OLE 回调也可能在别的线程进来，所以仍然用互斥量。
+/// 写进来只是为了「让用户看清松开会发生什么」——拖到标签行上要能看出
+/// 这一行是目标，否则打标签和加入快捷访问在外观上完全没有区别。
+static DRAG_PT: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+
+/// 取走拖动中的落点。`None` 表示这一轮拖动已经离开窗口（或已松手）。
+pub fn take_drag_point() -> Option<(i32, i32)> {
+    DRAG_PT.lock().ok().and_then(|mut slot| slot.take())
+}
+
 /// 落点所在的区域。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropZone {
@@ -425,6 +440,7 @@ unsafe extern "system" fn drag_enter(
     // 只在进入时判一次：这一次拖动的数据对象不会中途换人
     OUR_DRAG.store(data == OUR_DATA.load(Ordering::Relaxed), Ordering::Relaxed);
     set_effect(this, pt, effect);
+    note_drag_point(this, pt);
     S_OK
 }
 
@@ -435,10 +451,40 @@ unsafe extern "system" fn drag_over(
     effect: *mut u32,
 ) -> i32 {
     set_effect(this, pt, effect);
+    note_drag_point(this, pt);
     S_OK
 }
 
-unsafe extern "system" fn drag_leave(_this: *mut c_void) -> i32 {
+/// 记下落点，供 UI 线程画「会落在哪一行」的高亮。
+///
+/// 窗口内拖拽和从资源管理器拖进来走同一条路：两种来源落到标签行上都会打
+/// 标签，高亮就该一样。只有状态真的变了才投消息——拖动时这条回调跟着指针
+/// 走，每次都投会把消息队列灌满，重绘反而是白干。
+unsafe fn note_drag_point(this: *mut c_void, pt: PointL) {
+    let hwnd = (*(this as *mut DropTarget)).hwnd;
+    let next = match zone_at(hwnd, pt) {
+        (DropZone::NavPane, Some(point)) => Some(point),
+        _ => None,
+    };
+    let changed = if let Ok(mut slot) = DRAG_PT.lock() {
+        let changed = *slot != next;
+        *slot = next;
+        changed
+    } else {
+        false
+    };
+    if changed {
+        PostMessageW(hwnd, WM_DREAMFOLDER_DRAGOVER, 0, 0);
+    }
+}
+
+unsafe extern "system" fn drag_leave(this: *mut c_void) -> i32 {
+    // 离开窗口：清掉高亮，否则那一行会一直亮着像是还在拖
+    if let Ok(mut slot) = DRAG_PT.lock() {
+        *slot = None;
+    }
+    let hwnd = (*(this as *mut DropTarget)).hwnd;
+    PostMessageW(hwnd, WM_DREAMFOLDER_DRAGOVER, 0, 0);
     S_OK
 }
 
@@ -451,6 +497,11 @@ unsafe extern "system" fn drop_impl(
 ) -> i32 {
     let hwnd = (*(this as *mut DropTarget)).hwnd;
     let (zone, point) = zone_at(hwnd, pt);
+    // 松手：拖动高亮到此为止
+    if let Ok(mut slot) = DRAG_PT.lock() {
+        *slot = None;
+    }
+    PostMessageW(hwnd, WM_DREAMFOLDER_DRAGOVER, 0, 0);
     match zone {
         DropZone::Favbar => DROPPED_ON_FAVBAR.store(true, Ordering::Relaxed),
         DropZone::NavPane => DROPPED_ON_NAV.store(true, Ordering::Relaxed),

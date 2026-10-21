@@ -21,6 +21,7 @@ const FO_RENAME: u32 = 0x0004;
 
 const FOF_ALLOWUNDO: u16 = 0x0040;
 const FOF_NOCONFIRMMKDIR: u16 = 0x0200;
+const FOF_NOCONFIRMATION: u16 = 0x0010;
 
 /// 操作结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +157,11 @@ fn long_move(items: &[PathBuf], target_dir: &Path) -> OpResult {
             return OpResult::Failed(format!("无法确定名称：{}", it.display()));
         };
         let dst = target_dir.join(name);
+        if dst.exists() {
+            // Shell 路径会弹「替换/跳过」，长路径降级路径也必须有同样的
+            // 底线：直接落入 copy 会静默截断覆盖目标，数据没了还不可撤销。
+            return OpResult::Failed(format!("目标已存在：{}", dst.display()));
+        }
         // 同卷直接改名；跨卷会失败，退化成「先复制再删源」
         if std::fs::rename(it, &dst).is_err() {
             if let Err(msg) = copy_entry_long(it, target_dir) {
@@ -225,27 +231,14 @@ pub fn delete_to_recycle(hwnd: HWND, items: &[PathBuf]) -> OpResult {
 
 /// 永久删除（Shift+Delete）。
 pub fn delete_permanent(hwnd: HWND, items: &[PathBuf]) -> OpResult {
-    // 清掉 ALLOWUNDO 位即可——重新走一次调用
-    if items.is_empty() {
-        return OpResult::Ok;
-    }
+    // 长路径走不了 Shell：降级为逐条删除（带元数据清理），
+    // 其余路径照旧。确认框由应用层弹过了（自绘、模态于主窗口）；
+    // 不加 NOCONFIRMATION 的话 Shell 会从后台线程再弹一次系统确认框，
+    // 不模态、可能落到主窗口后面，看起来就像卡死。
     if too_long_for_shell(items) {
         return long_delete(items);
     }
-    let from_buf = multi_string(items);
-    let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
-    op.hwnd = hwnd;
-    op.wFunc = FO_DELETE;
-    op.pFrom = from_buf.as_ptr();
-    op.fFlags = FOF_NOCONFIRMMKDIR;
-    let code = unsafe { SHFileOperationW(&mut op) };
-    if op.fAnyOperationsAborted != 0 {
-        return OpResult::Cancelled;
-    }
-    if code != 0 {
-        return OpResult::Failed(describe_shell_error(code));
-    }
-    OpResult::Ok
+    do_operation(hwnd, FO_DELETE, items, &[], FOF_NOCONFIRMATION)
 }
 
 /// 重命名（同目录内改名）。单条目专用。

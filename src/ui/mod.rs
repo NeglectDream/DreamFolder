@@ -376,7 +376,10 @@ impl Layout {
         let icon_px = s(view_mode.icon_size());
         let cell_w = if cw == 0 { s(112) } else { s(cw).max(icon_px + s(24)) };
         let cell_h = s(ch).max(icon_px + s(34));
-        let avail_w = (self.content_right() - vr.left).max(cell_w);
+        // 可用宽度基准必须与命中测试/绘制一致（视图矩形全宽）。以前用
+        // content_right() 封顶，窗口拉宽超过 VIEW_MAX_W 后列数和绘制
+        // 对不上，框选选中的项与框住的格子错开几列。
+        let avail_w = (vr.right - vr.left).max(cell_w);
         let cols = (avail_w / cell_w).max(1) as usize;
 
         let col = (i % cols) as i32;
@@ -679,6 +682,8 @@ pub enum Hit {
     Up,
     Refresh,
     Address,
+    /// 地址栏里落在某一层路径上（点它＝跳到该层，而不是进编辑态）
+    AddressLevel,
     Search,
     FavoriteItem(usize),
     FavoriteMore,

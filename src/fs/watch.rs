@@ -33,7 +33,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-use crate::win::to_wide;
+use crate::win::to_wide_path;
 
 /// 变化之后先歇一会儿再听下一轮：复制整个目录会连出上百条通知，
 /// 这段时间攒下的一律算作同一次刷新（上层还有 300ms 防抖）。
@@ -139,7 +139,7 @@ fn watcher_loop(dir: &Path, stop_raw: usize, hwnd: isize, msg: u32) {
         return;
     }
 
-    let wide = to_wide(&dir.to_string_lossy());
+    let wide = to_wide_path(dir);
     // SAFETY: wide 是 NUL 结尾宽串；文件名参数传目录时必须带
     // FILE_FLAG_BACKUP_SEMANTICS，否则一律 ACCESS_DENIED。
     // FILE_FLAG_OVERLAPPED 是下面 `ReadDirectoryChangesW` 不阻塞的前提。
@@ -206,8 +206,33 @@ fn watcher_loop(dir: &Path, stop_raw: usize, hwnd: isize, msg: u32) {
             if hwnd != 0 {
                 unsafe { PostMessageW(hwnd as *mut std::ffi::c_void, msg, 0, 0) };
             }
-            // 突发变化合并：这段时间不再重复投递，顺便让上层收完一波
+            // 突发变化合并：歇一会儿再听下一轮。合并期间**必须重新挂起
+            // 一次 ReadDirectoryChangesW**——空窗里没有挂起请求的话，
+            // 内核不记这期间的变化，落进去的文件就再也不触发刷新了。
+            let mut coalesce_ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+            coalesce_ov.hEvent = event;
+            unsafe { ResetEvent(event) };
+            let mut coalesce_returned = 0u32;
+            let requeued = unsafe {
+                ReadDirectoryChangesW(
+                    handle,
+                    buf.as_mut_ptr().cast(),
+                    buf.len() as u32,
+                    0,
+                    filter,
+                    &mut coalesce_returned,
+                    &mut coalesce_ov,
+                    None,
+                ) != 0
+            };
             unsafe { WaitForSingleObject(stop, COALESCE_MS) };
+            if requeued {
+                // 等待窗口里若真的又来了变化：事件已置位，直接投递。
+                // 下一轮循环会先复位再重挂，不会重复消费这次完成。
+                if unsafe { WaitForSingleObject(event, 0) } == WAIT_OBJECT_0 && hwnd != 0 {
+                    unsafe { PostMessageW(hwnd as *mut std::ffi::c_void, msg, 0, 0) };
+                }
+            }
         } else {
             // 停止（或等待失败）：取消挂起的请求，别把线程留在内核调用里
             unsafe {

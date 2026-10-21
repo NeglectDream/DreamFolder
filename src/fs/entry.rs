@@ -139,7 +139,9 @@ impl Entry {
     pub fn is_image(&self) -> bool {
         matches!(
             self.ext().as_str(),
-            "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tif" | "tiff" | "webp" | "ico"
+            // 没有 webp：GDI+ 的内置编解码器不含 WebP，放进来只会得到
+            // 永远解不开的占位图标和「无法解码这张图片」的预览。
+            "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tif" | "tiff" | "ico"
         )
     }
 

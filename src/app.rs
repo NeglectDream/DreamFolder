@@ -185,6 +185,11 @@ pub struct Tab {
     /// 枚举移到了后台，所以「导航到某文件并在列表里选中它」没法立刻做完：
     /// 先记下名字，等结果回来再落地（见 `Application::on_io`）。
     pub pending_select: Option<String>,
+    /// 刚新建出来的文件名：枚举落地后选中它并直接进入重命名。
+    ///
+    /// 资源管理器新建完立刻就能打字改名，是因为它的视图能收到 Shell 的通知；
+    /// 我们自己画的列表收不到，只能由建文件的那一侧把名字递过来。
+    pub pending_rename: Option<String>,
     /// 驱动器的卷标与容量（「此电脑」视图用）。后台补查后回填。
     pub drive_info: Vec<crate::io::DriveInfo>,
 
@@ -200,6 +205,19 @@ pub struct Tab {
     /// 目录还在加载时按了回车（或 `/searchkey` 启动）：等枚举落地后
     /// 自动补一次搜索，而不是无声丢掉。见 `begin_search`。
     pub pending_search: bool,
+    /// 本标签最近一次枚举请求的序号。
+    ///
+    /// 以前用全局 `nav_seq` 校验结果：启动时恢复多个标签会同时发出多份
+    /// 枚举，只有最后一份数字对得上，其余标签的结果全被丢掉——列表
+    /// 永远停在「正在加载」。序号改成每标签一份，各自只跟自己的最新
+    /// 请求比对；全局 `nav_seq` 仍保留，用于生成不重复的 ID。
+    pub list_id: u64,
+    /// 本标签最近一次搜索请求的序号。
+    ///
+    /// 搜索结果按 `(标签, 序号)` 校验。以前只有一个全局序号：两个标签
+    /// 先后发起搜索，先发起的那个序号立刻过期，结果被丢弃，那个标签
+    /// 只能一直转到「搜索超时」。
+    pub search_id: u64,
 }
 
 impl Tab {
@@ -231,12 +249,15 @@ impl Tab {
             error: None,
             sort,
             pending_select: None,
+            pending_rename: None,
             drive_info: Vec::new(),
             search_text: String::new(),
             search_caret: 0,
             search_state: None,
             search_backup: None,
             pending_search: false,
+            list_id: 0,
+            search_id: 0,
         }
     }
 }
@@ -368,12 +389,18 @@ pub struct Application {
     /// 这样「连续切目录」「连续换选中项」不会被旧结果覆盖。
     nav_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
     preview_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// 搜索的请求序号（发号器，全局一份；每标签的有效序号看 `Tab::search_id`）。
     search_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// 正在等预览结果的文件：同一份不要反复投递。
     preview_pending: Option<PathBuf>,
 
     /// 快捷项拖动时的落点 y（画插入指示线用）。
     pub nav_drop_y: Option<i32>,
+    /// 文件正被拖到哪一条导航行上（松手就打标签的那一行）。
+    ///
+    /// 拖动期间由 `IDropTarget::DragOver` 投消息驱动，只在落点是标签行时
+    /// 有值：打标签和「加入快捷访问」外观完全一样，不给高亮用户没法预判。
+    pub drop_tag_row: Option<usize>,
     /// 各分组自上而下的顺序与屏幕范围（拖动分隔线换位时算落点用）。
     pub nav_groups: Vec<crate::ui::navpane::GroupSpan>,
     /// 正在拖动某条分组分隔线（＝拖动它下面那一组）。
@@ -392,6 +419,8 @@ pub struct Application {
     pub type_buffer: String,
     /// 上一次字母键的时刻，超过 1 秒就重新开始累积。
     pub type_time: Option<std::time::Instant>,
+    /// 目录变化时正在编辑态，刷新被推迟：编辑收尾时补一次刷新。
+    pub pending_fs_refresh: bool,
 
     /// 设置面板是否打开。打开时它是模态的：先吃消息再往下传。
     pub settings_open: bool,
@@ -436,6 +465,12 @@ pub struct Application {
     pub address_sel: Option<(usize, usize)>,
     pub address_text: String,
     pub address_caret: usize,
+    /// 非编辑态地址栏里每一段路径的可点区间：`(left, right, 前缀)`。
+    ///
+    /// 由绘制层在量完字宽之后回填——每段的边界必须和真正画出来的像素一致，
+    /// 命中测试自己再估一遍就会「画在这里、点在那里」。点某段即跳去该层，
+    /// 点空白才进编辑态。
+    pub address_segments: Vec<(i32, i32, String)>,
     /// 地址栏历史下拉的候选（按当前输入前缀匹配，见 `cfg::history`）。
     pub addr_suggest: Vec<String>,
     /// 下拉里键盘高亮的那一条。
@@ -513,6 +548,7 @@ impl Application {
             nav_press: None,
             nav_drag: None,
             nav_drop_y: None,
+            drop_tag_row: None,
             tooltip_ready: false,
             preview: None,
             io: crate::io::Io::new(),
@@ -529,6 +565,7 @@ impl Application {
             nav_content_h: 0,
             scroll_drag: None,
             type_buffer: String::new(),
+            pending_fs_refresh: false,
             type_time: None,
             settings_open: false,
             dialog: None,
@@ -548,6 +585,7 @@ impl Application {
             address_sel: None,
             address_text: String::new(),
             address_caret: 0,
+            address_segments: Vec::new(),
             addr_suggest: Vec::new(),
             addr_suggest_sel: None,
             search_focused: false,
@@ -642,6 +680,16 @@ impl Application {
             crate::fs::icons::apply_window_icons(hwnd);
             DragAcceptFiles(hwnd, 1);
 
+            // 「新建」的类型表要扫一遍 HKCR（上万个键）。放在第一次右键里
+            // 做会让那一下明显发顿，这里提前在后台扫好，结果进 OnceLock。
+            // 失败无所谓：右键时会再扫一次。
+            std::thread::Builder::new()
+                .name("dreamfolder-shellnew".to_string())
+                .spawn(|| {
+                    let _ = crate::win::shellnew::warm_up();
+                })
+                .ok();
+
             // 后台 IO 在这里绑定句柄：此后后台干完活就能 PostMessage 唤醒我们。
             // 必须早于 open_initial_tabs——初始标签的目录枚举就走后台。
             self.io.bind(hwnd);
@@ -722,6 +770,18 @@ impl Application {
 
     /// 依据启动设置打开初始标签。
     fn open_initial_tabs(&mut self) {
+        // 0) /curdir= 启动目录（原软件语义：作为首个标签的落点）
+        // 只在没有显式路径参数时生效
+        if self.cl.path.is_none() {
+            if let Some(d) = self.cl.cur_dir.clone() {
+                if d.is_dir() {
+                    self.new_tab(Some(d));
+                    // 起始目录也算用户意图，直接返回，不再叠加启动模式
+                    return;
+                }
+            }
+        }
+
         // 1) 命令行给出的路径优先
         if let Some(p) = self.cl.path.clone() {
             if p.is_dir() {
@@ -731,17 +791,12 @@ impl Application {
             if let Some(parent) = p.parent() {
                 let parent = parent.to_path_buf();
                 self.new_tab(Some(parent));
-                // 顺带选中该文件
+                // 枚举在后台进行，此刻列表还是空的。记下名字，
+                // 枚举落地时由 on_io 选中并滚动到它。
                 let name = p.file_name().map(|s| s.to_string_lossy().into_owned());
                 if let Some(name) = name {
-                    if let Some(idx) = self.tabs[self.active_tab]
-                        .entries
-                        .iter()
-                        .position(|e| e.name.eq_ignore_ascii_case(&name))
-                    {
-                        self.tabs[self.active_tab].selected.clear();
-                        self.tabs[self.active_tab].selected.insert(idx);
-                        interact::scroll_into_view(self, idx);
+                    if let Some(t) = self.active_mut() {
+                        t.pending_select = Some(name);
                     }
                 }
                 return;
@@ -763,14 +818,37 @@ impl Application {
                 let saved = self.cfg.session.tabs.clone();
                 let mut activated = false;
                 for rec in &saved {
-                    if rec.path.is_dir() {
+                    // 三类标签都能恢复：普通目录按路径，「此电脑」与回收站
+                    // 是伪路径，`is_dir()` 恒为 false——以前这两类标签
+                    // 退出再启动就凭空消失。
+                    let ok = match rec.kind {
+                        crate::cfg::session::TabKind::Dir => rec.path.is_dir(),
+                        crate::cfg::session::TabKind::Computer => {
+                            rec.path.as_os_str().is_empty()
+                        }
+                        crate::cfg::session::TabKind::Recycle => {
+                            rec.path.to_string_lossy() == RECYCLE_PATH
+                        }
+                    };
+                    if ok {
                         let before = self.tabs.len();
-                        self.new_tab(Some(rec.path.clone()));
-                        if self.tabs.len() > before {
-                            let t = &mut self.tabs[before];
+                        if rec.kind == crate::cfg::session::TabKind::Recycle {
+                            self.new_tab(Some(user_home()));
+                            self.open_recycle_bin();
+                        } else {
+                            self.new_tab(Some(rec.path.clone()));
+                        }
+                        if self.tabs.len() > before || rec.kind == crate::cfg::session::TabKind::Recycle {
+                            // 回收站走 open_recycle_bin 改造的是当前标签
+                            let i = if rec.kind == crate::cfg::session::TabKind::Recycle {
+                                self.active_tab
+                            } else {
+                                before
+                            };
+                            let t = &mut self.tabs[i];
                             t.view_mode = rec.view;
                             if rec.active {
-                                self.active_tab = before;
+                                self.active_tab = i;
                                 activated = true;
                             }
                         }
@@ -872,7 +950,10 @@ impl Application {
 
 
     pub fn can_go_back(&self) -> bool {
-        self.active().map(|t| t.history_pos > 0).unwrap_or(false)
+        self.active()
+            // 搜索视图也算一格「来路」：后退的第一下用来退出搜索
+            .map(|t| t.search_backup.is_some() || t.history_pos > 0)
+            .unwrap_or(false)
     }
 
     pub fn can_go_forward(&self) -> bool {
@@ -883,11 +964,22 @@ impl Application {
 
     pub fn can_go_up(&self) -> bool {
         self.active()
-            .map(|t| !t.is_computer && fs::parent_of(&t.path).is_some())
+            .map(|t| {
+                // 搜索视图下「上一级」先退出搜索，任何目录（含「此电脑」、
+                // 盘符根）都得是能点的，否则这个出口就永远点不到
+                t.search_backup.is_some()
+                    || (!t.is_computer && fs::parent_of(&t.path).is_some())
+            })
             .unwrap_or(false)
     }
 
     pub fn go_back(&mut self) {
+        // 搜索结果上按后退＝退回搜索前的视图。搜索不算一次路径导航
+        // （history 里没有它），先把它消化掉，否则会越过当前目录
+        // 直接跳到上一个历史位置。
+        if self.leave_search_view() {
+            return;
+        }
         let target = {
             let Some(t) = self.active_mut() else { return };
             if t.history_pos == 0 {
@@ -925,6 +1017,14 @@ impl Application {
     }
 
     pub fn go_up(&mut self) {
+        // 搜索结果上按「上一级」先退出搜索、留在搜索起点那个目录。
+        //
+        // 搜索不改标签路径，所以直接按路径上跳时，`D:\A\B` 的搜索结果会
+        // 一步落到 `D:\A`——用户搜索时所在的 `D:\A\B` 被跳过去了，
+        // 看起来像「一下上了两级」。退出搜索才是这一步该做的事。
+        if self.leave_search_view() {
+            return;
+        }
         let target = {
             let Some(t) = self.active() else { return };
             if t.is_computer {
@@ -1090,8 +1190,14 @@ impl Application {
             t.scroll_y = 0;
             t.error = None;
             t.loading = true;
-            // 换了目录就不是原来那个搜索意图了，挂起的搜索别跟过来
+            // 换了目录就不是原来那个搜索意图了，全部作废（同目录刷新
+            // 不清这些，见 reload_active_tab）
+            t.search_backup = None;
+            t.search_state = None;
             t.pending_search = false;
+            t.pending_rename = None;
+            t.search_text.clear();
+            t.search_caret = 0;
         }
 
         // 记录地址历史（原软件的 addr_history.ini）
@@ -1216,15 +1322,16 @@ impl Application {
             t.scroll_y = 0;
             t.error = None;
             t.loading = true;
-            // 换了目录，这个标签上一次搜索的状态和结果都不再成立
+            // 同目录刷新（F5、Shell 菜单收起、目录变化自动刷新）不动搜索：
+            // 用户敲到一半的词被清掉，比列表旧几秒更让人恼火。
+            // 换目录（load_into_active）才把上一次的搜索状态全部作废。
             t.search_backup = None;
             t.search_state = None;
             t.pending_search = false;
-            t.search_text.clear();
-            t.search_caret = 0;
         }
 
         let id = self.nav_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.tabs[idx].list_id = id;
         self.io.send(Job::List {
             id,
             tab: idx,
@@ -1291,7 +1398,13 @@ impl Application {
             || self.address_editing
             || self.search_focused
             || self.dialog.is_some()
+            || self.settings_open
         {
+            // 编辑态不能立刻刷（列表一换，正在编辑的下标就失效）。
+            // 但 TIMER_FS 是一次性的，直接丢掉这次变化就永远不刷了——
+            // 记一个待刷新标志，编辑收尾处（cancel_edit/commit_edit/
+            // 对话框与设置面板关闭）补上。
+            self.pending_fs_refresh = true;
             return;
         }
         let Some(t) = self.active() else { return };
@@ -1301,6 +1414,22 @@ impl Application {
             return;
         }
         self.refresh_active_tab();
+    }
+
+    /// 编辑收尾时补上被推迟的目录刷新（见 `apply_fs_change`）。
+    pub(crate) fn flush_pending_fs_refresh(&mut self) {
+        if !self.pending_fs_refresh {
+            return;
+        }
+        self.pending_fs_refresh = false;
+        if !self.rename_active()
+            && !self.address_editing
+            && !self.search_focused
+            && self.dialog.is_none()
+            && !self.settings_open
+        {
+            self.refresh_active_tab();
+        }
     }
 
     /// 应用一条后台结果。过期的（请求号不是最新的）直接丢。
@@ -1314,12 +1443,12 @@ impl Application {
                 entries,
                 error,
             } => {
-                if id != self.nav_seq.load(Ordering::SeqCst) {
-                    return;
-                }
                 let Some(t) = self.tabs.get_mut(tab) else {
                     return;
                 };
+                if id != t.list_id {
+                    return;
+                }
                 // 标签可能已经换了目录（或用同一标签又发了一次请求）
                 if t.path != path {
                     return;
@@ -1355,8 +1484,27 @@ impl Application {
                         t.anchor = focus_at;
                     }
                 }
+                // 「新建」后的补位：建文件那一步已经把名字递过来了，
+                // 这里按名字找到它，选中并直接进入重命名——
+                // 这就是资源管理器「新建完就能直接打字改名」的手感。
+                let mut fresh_one = None;
+                if let Some(name) = t.pending_rename.take() {
+                    if let Some(i) = t.entries.iter().position(|e| e.name == name) {
+                        t.selected.clear();
+                        t.selected.insert(i);
+                        t.anchor = Some(i);
+                        t.focus = Some(i);
+                        fresh_one = Some(i);
+                    }
+                }
                 // 图标键/类型名在数据落地时补齐，绘制路径上只读
                 self.fill_entry_meta(tab);
+                if let Some(i) = fresh_one {
+                    if tab == self.active_tab {
+                        crate::ui::interact::scroll_into_view(self, i);
+                        self.begin_rename_selection();
+                    }
+                }
                 // 加载中按过回车（或 /searchkey 启动）的搜索，现在有可
                 // 备份的原始列表了，补上那次没发出去的搜索
                 if self.tabs[tab].pending_search && tab == self.active_tab {
@@ -1365,12 +1513,12 @@ impl Application {
                 }
             }
             crate::io::Done::Volumes { id, tab, infos } => {
-                if id != self.nav_seq.load(Ordering::SeqCst) {
-                    return;
-                }
                 let Some(t) = self.tabs.get_mut(tab) else {
                     return;
                 };
+                if id != t.list_id {
+                    return;
+                }
                 t.drive_info = infos;
                 apply_drive_info(t);
             }
@@ -1392,15 +1540,13 @@ impl Application {
                 self.request_repaint();
             }
             crate::io::Done::Searched { id, tab, key, hits } => {
-                if id != self.search_seq.load(Ordering::SeqCst) {
-                    return;
-                }
-                // 结果落到「发起搜索的那个标签」上，而不是当前标签：搜索
-                // 跑在后台，期间用户完全可以切到别的标签去。以前这里一旦
-                // 切走就整条结果丢弃，那个标签会永远停在「正在搜索…」。
+                // 按发起搜索的那个标签自己的序号比对，两标签并发搜索互不干扰
                 let Some(t) = self.tabs.get_mut(tab) else {
                     return;
                 };
+                if id != t.search_id {
+                    return;
+                }
                 // 该标签的搜索词必须没变过（用户可能改了词或退出了搜索）
                 if key != t.search_text.trim().to_lowercase() {
                     return;
@@ -1519,6 +1665,18 @@ impl Application {
         self.apply_folder_view(idx);
         self.reload_active_tab();
         self.request_repaint();
+    }
+
+    /// 标签栏「+」：开一个「此电脑」标签。
+    ///
+    /// 不再是「复制当前目录」——在同一个目录里连开两个标签没有任何用处，
+    /// 而点加号的人通常是从零开始找盘。空路径在这个项目里就是「此电脑」，
+    /// 标题、地址栏、导航高亮都按它走（同 `nav_activate` 的 `Computer` 分支）。
+    ///
+    /// Ctrl+T 保持「复制当前目录」：那是「在这里再开一个」的语义，
+    /// 两者入口不同、意图不同，不必强行一致。
+    pub fn new_computer_tab(&mut self) {
+        self.new_tab(Some(PathBuf::new()));
     }
 
     /// 关闭标签。`force` 为 true 时忽略「最后一个标签」保护。
@@ -2097,6 +2255,46 @@ impl Application {
         }
     }
 
+    /// 点击地址栏某个 x 处：落在某一段路径上就返回该段的完整前缀。
+    ///
+    /// 区间由绘制层量完字宽后回填（见 `address_segments`），所以这里只管
+    /// 命中，不重算像素。段与段之间那一两个像素（分隔符）不算任何一段，
+    /// 落在那儿就当作「没点到路径」，交给调用方进编辑态。
+    pub fn address_segment_at(&self, x: i32) -> Option<&str> {
+        let t = self.active()?;
+        // 回收站、「此电脑」没有可下钻的层级：整条都是「点一下进编辑」
+        if t.is_recycle || t.is_computer {
+            return None;
+        }
+        self.address_segments
+            .iter()
+            .find(|(l, r, _)| x >= *l && x < *r)
+            .map(|(_, _, prefix)| prefix.as_str())
+    }
+
+    /// 点地址栏某一层：直接跳过去。
+    ///
+    /// 靠 `address_segment_at` 拿前缀，所以和绘制用的是同一份像素区间。
+    /// 点的就是当前这一层时改成进编辑态——跳到自己没有意义，但「点一下就
+    /// 能改路径」得留个入口，否则长路径铺满整条地址栏时就没有空白可点了。
+    pub fn jump_to_address_level(&mut self, x: i32) {
+        let Some(prefix) = self.address_segment_at(x).map(|s| s.to_string()) else {
+            return;
+        };
+        let path = std::path::PathBuf::from(prefix);
+        let same = self
+            .active()
+            .map(|t| !t.is_computer && !t.is_recycle && t.path == path)
+            .unwrap_or(false);
+        if same {
+            self.begin_address_edit_at(x);
+            return;
+        }
+        if path.is_dir() {
+            self.navigate_to(path);
+        }
+    }
+
     pub fn begin_address_edit(&mut self) {
         // 先取出文本，避免 &Tab 借用与随后的 &mut self 赋值同时存在
         let (is_computer, text) = {
@@ -2301,6 +2499,7 @@ impl Application {
         if matches!(self.cur().search_state, Some(SearchState::Pending)) {
             self.cur_mut().search_state = None;
         }
+        self.flush_pending_fs_refresh();
         self.request_repaint();
     }
 
@@ -2321,6 +2520,7 @@ impl Application {
                     }
                 }
             }
+            self.flush_pending_fs_refresh();
             return;
         }
 
@@ -2358,13 +2558,17 @@ impl Application {
                 } else if p.is_file() {
                     if let Some(parent) = p.parent() {
                         self.navigate_to(parent.to_path_buf());
+                        // 枚举还没落地，列表此刻多半没有它：记下名字，
+                        // on_io 补选中。已有条目时立刻选。
                         let fname = p.file_name().map(|s| s.to_string_lossy().into_owned());
                         if let Some(f) = fname {
-                            if let Some(idx) = self
+                            let found = self
                                 .active()
-                                .and_then(|t| t.entries.iter().position(|e| e.name == f))
-                            {
+                                .and_then(|t| t.entries.iter().position(|e| e.name == f));
+                            if let Some(idx) = found {
                                 self.select_entry(idx, false, false);
+                            } else if let Some(t) = self.active_mut() {
+                                t.pending_select = Some(f);
                             }
                         }
                     }
@@ -2509,6 +2713,7 @@ impl Application {
     /// 关掉对话框（不做任何动作）。
     pub fn dialog_cancel(&mut self) {
         if self.dialog.take().is_some() {
+            self.flush_pending_fs_refresh();
             self.request_repaint();
         }
     }
@@ -2601,6 +2806,8 @@ impl Application {
                 return;
             }
         }
+        // 对话框可能开着时目录变了（fs 刷新被推迟），关掉后补上
+        self.flush_pending_fs_refresh();
         self.request_repaint();
     }
 
@@ -2706,6 +2913,10 @@ impl Application {
             .map(|t| t.path.to_string_lossy().into_owned())
             .unwrap_or_default();
         let mut cmd = std::process::Command::new(exe);
+        // 必须显式带 /OpenInNewWindow：单实例接管对所有无开关启动生效，
+        // 不带开关的新进程会把路径投递回当前实例然后退出——用户以为
+        // 开了新窗口，实际只多了个标签。
+        cmd.arg("/OpenInNewWindow");
         if !arg.is_empty() {
             cmd.arg(arg);
         }
@@ -2812,7 +3023,19 @@ impl Application {
             };
             (paths, dir)
         };
-        crate::win::shellmenu::show(self.hwnd, &paths, dir.as_deref());
+        let inv = crate::win::shellmenu::show(self.hwnd, &paths, dir.as_deref());
+        // 点了「新建」但没建成（只读目录、无权限、磁盘满……）：
+        // 必须说出来，否则用户看到的就是“点了没反应”。
+        if let Some(err) = inv.new_error {
+            self.dialog_info(&format!("新建失败：{err}"));
+        }
+        // 「新建」是我们自己建的，名字已经知道了：枚举落地后按名字选中它
+        // 并直接进入重命名（资源管理器新建完就是这个手感）。
+        if let Some(name) = inv.created_new {
+            if let Some(t) = self.tabs.get_mut(self.active_tab) {
+                t.pending_rename = Some(name);
+            }
+        }
         // 菜单里可能执行了「删除」「重命名」「新建」这类改动文件系统的命令，
         // 关掉之后必须重新列一遍——以前只重绘，列表还停在旧内容上。
         self.reload_active_tab();
@@ -3086,6 +3309,77 @@ impl Application {
         self.request_repaint();
     }
 
+    /// 拖动经过时更新「会落在哪个标签行」的高亮。
+    ///
+    /// `DragOver` 已经把落点存进来了，这里只做命中：落在标签行或它的条目上
+    /// 就高亮那一行，其余情况清空。只在状态真的变了才重绘——拖动期间这条
+    /// 消息每移动一次就来一次，无脑重绘整块导航窗格纯属浪费。
+    pub fn update_drop_hover(&mut self) {
+        let next = crate::win::droptarget::take_drag_point().and_then(|(x, y)| {
+            if !crate::win::paint::rect_contains(self.layout.nav_pane, x, y) {
+                return None;
+            }
+            let i = crate::ui::navpane::row_at(&self.nav_rows, x, y)?;
+            match self.nav_rows.get(i).map(|r| r.kind.clone()) {
+                Some(crate::ui::navpane::NavKind::Tag { .. })
+                | Some(crate::ui::navpane::NavKind::TagItem { .. }) => Some(i),
+                _ => None,
+            }
+        });
+        if next != self.drop_tag_row {
+            self.drop_tag_row = next;
+            let r = self.layout.nav_pane;
+            self.request_repaint_rect(r);
+        }
+    }
+
+    /// 拖放落到导航窗格：落在标签行上就给它加这些路径，否则加进「快捷访问」。
+    ///
+    /// 窗口内拖拽和外部拖入共用这一处判定——各写一份的话早晚出现
+    /// 「从资源管理器拖能打标签、从自己列表里拖却只能加快捷访问」这种怪事。
+    pub fn drop_paths_onto_nav(&mut self, paths: &[PathBuf], pt: Option<(i32, i32)>) {
+        let tag = pt
+            .and_then(|(x, y)| crate::ui::navpane::row_at(&self.nav_rows, x, y))
+            .and_then(|i| match self.nav_rows.get(i).map(|r| r.kind.clone()) {
+                Some(crate::ui::navpane::NavKind::Tag { index, .. }) => Some(index),
+                // 拖到某个标签下的条目上也认这个标签：鼠标就在那一格里，
+                // 说「那我不算」没有道理
+                Some(crate::ui::navpane::NavKind::TagItem { tag, .. }) => Some(tag),
+                _ => None,
+            });
+        match tag {
+            Some(index) => {
+                self.drop_tag_row = None;
+                self.add_paths_to_tag(index, paths);
+            }
+            None => {
+                self.add_paths_to_nav_places(paths);
+            }
+        }
+    }
+
+    /// 把一批路径加进第 N 个标签。
+    ///
+    /// 和详情窗格的「加标签」走同一份 `cfg::tags`，所以 `touch()` 会让
+    /// 详情窗格的归属缓存一起失效，列表里的标签点也会跟着刷新。
+    pub fn add_paths_to_tag(&mut self, tag: usize, paths: &[PathBuf]) -> bool {
+        let mut changed = false;
+        for p in paths {
+            if self.cfg.tags.add_item(tag, p.clone()) {
+                changed = true;
+            }
+        }
+        if changed {
+            // 加完顺手展开：不展开的话界面上一点变化都没有，
+            // 用户会以为没加上，再拖一次
+            self.cfg.tags.expand(tag);
+            self.cfg.tags.save(&self.cfg.root);
+            self.rebuild_nav_rows();
+            self.request_repaint();
+        }
+        changed
+    }
+
     /// 从快捷访问区移除一项（不动磁盘上的文件）。
     pub fn remove_nav_place(&mut self, index: usize) {
         if self.cfg.nav_places.remove_at(index) {
@@ -3120,7 +3414,8 @@ impl Application {
 
     /// 处理外部拖入（OLE `IDropTarget` 已把路径捞出来，投消息通知到这里）。
     ///
-    /// 落在收藏栏 → 加书签；落在导航窗格 → 加进快捷访问。其它区域不接。
+    /// 落在收藏栏 → 加书签；落在导航窗格 → 看落点是不是标签行；
+    /// 落在文件视图 → 交给视图那条路径。其它区域不接。
     pub fn handle_external_drop(&mut self) {
         let Some((zone, paths)) = crate::win::droptarget::take_external_drop() else {
             return;
@@ -3128,7 +3423,8 @@ impl Application {
         match zone {
             crate::win::droptarget::DropZone::Favbar => self.add_paths_to_bookmarks(&paths),
             crate::win::droptarget::DropZone::NavPane => {
-                self.add_paths_to_nav_places(&paths);
+                let pt = crate::win::droptarget::take_drop_point();
+                self.drop_paths_onto_nav(&paths, pt);
             }
             crate::win::droptarget::DropZone::View => {
                 if let Some(pt) = crate::win::droptarget::take_drop_point() {
@@ -3258,20 +3554,28 @@ impl Application {
         // 窗口几何
         if hwnd_valid(self.hwnd) {
             unsafe {
-                let mut r: RECT = std::mem::zeroed();
-                if GetWindowRect(self.hwnd, &mut r) != 0 {
-                    let maxed = IsZoomed(self.hwnd) != 0;
-                    if !maxed {
-                        self.cfg.settings.window_x = r.left;
-                        self.cfg.settings.window_y = r.top;
-                        self.cfg.settings.window_w = r.right - r.left;
-                        self.cfg.settings.window_h = r.bottom - r.top;
+                // 最小化时 GetWindowRect 拿到的是 (-32000,-32000, 160×28) 这类
+                // 伪坐标；直接存会让下次启动把窗口建在屏幕外。最小化期间
+                // 关闭（任务栏右键）就是这个路径。IsIconic 检查放最前面。
+                if IsIconic(self.hwnd) != 0 {
+                    // 几何不更新，沿用上一次的合法值；最大化标志照实存
+                    self.cfg.settings.window_maximized = IsZoomed(self.hwnd) != 0;
+                } else {
+                    let mut r: RECT = std::mem::zeroed();
+                    if GetWindowRect(self.hwnd, &mut r) != 0 {
+                        let maxed = IsZoomed(self.hwnd) != 0;
+                        if !maxed {
+                            self.cfg.settings.window_x = r.left;
+                            self.cfg.settings.window_y = r.top;
+                            self.cfg.settings.window_w = r.right - r.left;
+                            self.cfg.settings.window_h = r.bottom - r.top;
+                        }
+                        self.cfg.settings.window_maximized = maxed;
+                        // 退出时窗口几何已经落定——不管是用户拖出来的、还是启动时
+                        // 按屏幕推出来的。标记一下，下次启动直接沿用，
+                        // 不再重新推导（否则用户调好的尺寸每次都会被覆盖）。
+                        self.cfg.settings.window_geometry_set = true;
                     }
-                    self.cfg.settings.window_maximized = maxed;
-                    // 退出时窗口几何已经落定——不管是用户拖出来的、还是启动时
-                    // 按屏幕推出来的。标记一下，下次启动直接沿用，
-                    // 不再重新推导（否则用户调好的尺寸每次都会被覆盖）。
-                    self.cfg.settings.window_geometry_set = true;
                 }
             }
         }
@@ -3279,10 +3583,18 @@ impl Application {
         // 会话标签
         self.cfg.session.tabs.clear();
         for (i, t) in self.tabs.iter().enumerate() {
+            let kind = if t.is_computer {
+                crate::cfg::session::TabKind::Computer
+            } else if t.is_recycle {
+                crate::cfg::session::TabKind::Recycle
+            } else {
+                crate::cfg::session::TabKind::Dir
+            };
             self.cfg.session.tabs.push(crate::cfg::session::TabRecord {
                 path: t.path.clone(),
                 view: t.view_mode,
                 active: i == self.active_tab,
+                kind,
             });
         }
         // 直接把当前标签的视图/排序状态写回设置。

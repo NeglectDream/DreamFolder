@@ -198,6 +198,19 @@ impl Tags {
         }
     }
 
+    /// 展开某个标签（已展开则不变）。
+    ///
+    /// 拖文件到标签行上时用它：加完不展开，界面上没有任何变化，
+    /// 用户会以为没加上又拖一次。
+    pub fn expand(&mut self, index: usize) {
+        if let Some(t) = self.list.get_mut(index) {
+            if !t.expanded {
+                t.expanded = true;
+                self.touch();
+            }
+        }
+    }
+
     /// 路径出现在哪些标签里（详情窗格据此列出「已归属的标签」）。
     ///
     /// 结果按 `(版本, 路径)` 缓存：绘制与命中测试每帧各查一次，

@@ -92,6 +92,14 @@ impl<'a> Painter<'a> {
 /// 以前每次都把标题栏、导航窗格、整个文件列表重画一遍，纯属白烧 CPU。
 /// 与脏区不相交的区域直接不画，它们留在位图里的还是上一帧的样子。
 pub fn paint(app: &mut Application, hdc: HDC, dirty: RECT) {
+    // 绘制范围必须与提交范围严格一致。
+    //
+    // 离屏位图跨帧保留，而一次 WM_PAINT 只有 `dirty` 那一块会被 blit 上屏。
+    // 各区域函数是「整块重画」的，加上浮层完全不看脏区，画出来的东西会超出
+    // dirty；这些像素留在位图里、屏幕上看不到，下一帧 blit 邻接区域时突然
+    // 冒出来——表现就是残影和错位。所以先把 DC 裁到脏区，越界绘制直接丢弃。
+    let guard = Canvas::new(hdc);
+    let clip = guard.clip(dirty);
     // 先克隆需要的只读数据，避免 &mut app 与 &canvas 的借用冲突
     let layout = app.layout;
     let palette = *app.palette_for_theme();
@@ -144,12 +152,89 @@ pub fn paint(app: &mut Application, hdc: HDC, dirty: RECT) {
     paint_settings(app, hdc, &layout, &palette);
     // 对话框比设置面板更靠上（命中测试也是先判它）
     paint_dialog(app, hdc, &layout, &palette);
+
+    guard.unclip(clip);
 }
 
 /// 两个矩形是否有重叠。
 fn rects_overlap(a: RECT, b: RECT) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
+
+/// 把路径文本切成层级段：`(段起始字符, 前缀结束字符, 可跳转的前缀)`。
+///
+/// `C:\Users\me\Desktop` 切成 `C:\` / `C:\Users` / `C:\Users\me` /
+/// `C:\Users\me\Desktop` 四段。抽成纯函数是为了能直接测：切错了就是
+/// 「点这段跳到隔壁那一层」，界面上很难一眼看出来。
+fn path_levels(text: &str) -> Vec<(usize, usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    // 先按分隔符切出每段的范围（段本身不含分隔符）
+    let mut bounds: Vec<(usize, usize)> = Vec::new();
+    let mut seg_start = 0usize;
+    for (i, c) in chars.iter().enumerate() {
+        if (*c == '\\' || *c == '/') && i > seg_start {
+            bounds.push((seg_start, i));
+            seg_start = i + 1;
+        }
+    }
+    if seg_start < chars.len() {
+        bounds.push((seg_start, chars.len()));
+    }
+
+    let mut out = Vec::with_capacity(bounds.len());
+    for (start, end) in bounds {
+        // 只有分隔符的段不是层级（UNC 路径开头的 `\\` 就会切出这么一段），
+        // 它跳不过去，也就不该占一块可点区域
+        if chars[start..end].iter().all(|c| *c == '\\' || *c == '/') {
+            continue;
+        }
+        let mut prefix: String = chars[..end].iter().collect();
+        // 盘符段（`C:`）单独跳转不是有效路径，补上分隔符变成 `C:\`
+        if prefix.ends_with(':') {
+            prefix.push('\\');
+        }
+        out.push((start, end, prefix));
+    }
+    out
+}
+
+/// 层级段的像素区间：把 `path_levels` 的结果换算到地址栏里，供绘制与命中共用。
+///
+/// 区间按真实字宽累加（和真正画出来的字同一份度量），并且把分隔符算进左侧段，
+/// 这样整条地址栏没有「点了没反应」的缝。超出可视区的段直接丢掉：看不见的
+/// 东西不该能被点中。
+fn path_level_segments(
+    canvas: &Canvas,
+    font: HFONT,
+    text: &str,
+    clip: RECT,
+) -> Vec<(i32, i32, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let levels = path_levels(text);
+    let mut out = Vec::with_capacity(levels.len());
+    for (i, (start, end, prefix)) in levels.iter().enumerate() {
+        let before: String = chars[..*start].iter().collect();
+        let upto: String = chars[..*end].iter().collect();
+        let left = clip.left + canvas.text_width(&before, font);
+        // 右边界含分隔符：接到下一段的起点，中间不留缝
+        let right = match levels.get(i + 1) {
+            Some((next_start, _, _)) => {
+                let s: String = chars[..*next_start].iter().collect();
+                clip.left + canvas.text_width(&s, font)
+            }
+            None => clip.left + canvas.text_width(&upto, font),
+        };
+        let (left, right) = (left.max(clip.left), right.min(clip.right));
+        if right > left {
+            out.push((left, right, prefix.clone()));
+        }
+    }
+    out
+}
+
 
 /// 框选矩形。只画边和一层很淡的填充——填充太实会盖住底下的文件名。
 fn paint_marquee(app: &Application, hdc: HDC, layout: &Layout, palette: &Palette) {
@@ -211,12 +296,18 @@ fn paint_titlebar_and_tabs(
         } else {
             palette.tab_inactive
         };
-        canvas.round_fill(r, p.s(4), bg, None);
+        canvas.fill(r, bg);
 
-        // 激活标签顶部强调线
+        // 激活标签：顶部一条通栏强调条。形状本身就是「当前」的标记，
+        // 不依赖底色深浅——深色主题里底色差只有一两级，靠它根本分不清。
         if is_active {
-            let accent = rect(r.left + p.s(6), r.top, r.right - p.s(6), r.top + p.s(2));
-            canvas.round_fill(accent, p.s(1), palette.accent, None);
+            canvas.fill(
+                rect(r.left, r.top, r.right, r.top + p.s(3)),
+                palette.accent,
+            );
+        } else {
+            // 非激活标签之间用 1px 硬分隔线断开，替代靠色差的「软边界」
+            canvas.vline(r.left, r.top + p.s(6), r.bottom - p.s(6), palette.border_light);
         }
 
         // 标签图标：目录统一用文件夹图标（走缓存，无系统调用）
@@ -239,8 +330,9 @@ fn paint_titlebar_and_tabs(
         );
         let font = app.font_tab();
 
+        // 激活标签的文字用 text_strong：比正文再重一档，扫一眼就能定位
         let fg = if is_active {
-            palette.text
+            palette.text_strong
         } else {
             palette.text_dim
         };
@@ -266,13 +358,15 @@ fn paint_titlebar_and_tabs(
     // ---- 新建标签按钮 ----
     let nt = layout.new_tab_rect(count);
     if p.is_hover(Hit::NewTab) {
-        canvas.round_fill(nt, p.s(3), palette.button_hover, None);
+        canvas.fill(nt, palette.button_hover);
     }
     draw_plus_glyph(&canvas, nt, palette);
 
     // ---- 窗口按钮 ----
     let wb = layout.window_buttons;
     let bw = (wb.right - wb.left) / super::winbtn::COUNT as i32;
+    // 标签区与窗口控制区之间的硬分隔线：两类操作本来就不该混在一起找
+    canvas.vline(wb.left - 1, wb.top + p.s(8), wb.bottom - p.s(8), palette.divider);
     let btns = [
         (super::winbtn::MENU, Hit::MenuButton),
         (super::winbtn::MIN, Hit::Minimize),
@@ -298,16 +392,15 @@ fn paint_titlebar_and_tabs(
             };
             canvas.fill(r, color);
         }
-        draw_window_glyph(&canvas, r, hit, palette);
+        draw_window_glyph(&canvas, r, hit, palette, hov || prs);
     }
 }
 
-fn draw_window_glyph(canvas: &Canvas, r: RECT, hit: Hit, palette: &Palette) {
+fn draw_window_glyph(canvas: &Canvas, r: RECT, hit: Hit, palette: &Palette, hot: bool) {
     let cx = (r.left + r.right) / 2;
     let cy = (r.top + r.bottom) / 2;
-    // 悬停时底色是浅一档的灰，字形一律保持正文色；
-    // 以前关闭按钮配深红底才需要反白，现在不需要了。
-    let color = palette.text;
+    // 图标主色随状态走：悬停时用正文重色，平时用 icon 一档
+    let color = if hot { palette.text_strong } else { palette.icon };
 
     match hit {
         Hit::MenuButton => {
@@ -338,21 +431,20 @@ fn draw_window_glyph(canvas: &Canvas, r: RECT, hit: Hit, palette: &Palette) {
 fn draw_close_glyph(canvas: &Canvas, r: RECT, palette: &Palette, bg: u32, hot: bool) {
     let cx = (r.left + r.right) / 2;
     let cy = (r.top + r.bottom) / 2;
-    // 悬停：叉号外面垫一个深色**圆**，叉号反白。
+    // 悬停：叉号底下垫一个实心**方**块，叉号反白。
     //
-    // 这里踩过两次坑，别再改回去：
-    // 1) 曾经用 `round_fill(r, radius, ..)` 想画圆底，但 `round_fill` 现在按直角
-    //    绘制（圆角是历史遗留参数，见 paint.rs），结果是一块近黑实心方块；
-    // 2) 干脆不画底之后，叉号虽然在，却少了「这里可以点」的那圈提示。
-    // 所以现在用 `circle_fill` 真画圆，并把标签当前底色传进去做边缘混合，
-    // 抗锯齿不会出现锯齿黑边。叉号用 `tab_active` 反色，深浅主题都够醒目。
+    // 以前这里用 `circle_fill` 画圆底（`round_fill` 改成直角之后没有别的
+    // 圆角手段）。整套界面现在是直角语言，一个圆点悬停框反而是唯一的例外，
+    // 看着像从别的软件抠过来的。方形底 + 反白叉号同样清楚，还和标签的
+    // 强调条、选中块的边缘对齐。
     let color = if hot {
-        let radius = ((r.right - r.left).min(r.bottom - r.top) / 2 - 1).max(7);
-        canvas.circle_fill(cx, cy, radius, palette.text, bg);
+        canvas.fill(r, palette.text_strong);
         palette.tab_active
     } else {
-        palette.text_dim
+        palette.icon_dim
     };
+    // `bg` 现在只为签名兼容保留（反色改为直接取 tab_active）
+    let _ = bg;
     for i in -4..=4 {
         canvas.fill(rect(cx + i, cy + i, cx + i + 1, cy + i + 1), color);
         canvas.fill(rect(cx + i, cy - i, cx + i + 1, cy - i + 1), color);
@@ -362,7 +454,7 @@ fn draw_close_glyph(canvas: &Canvas, r: RECT, palette: &Palette, bg: u32, hot: b
 fn draw_plus_glyph(canvas: &Canvas, r: RECT, palette: &Palette) {
     let cx = (r.left + r.right) / 2;
     let cy = (r.top + r.bottom) / 2;
-    let color = palette.text;
+    let color = palette.icon;
     canvas.hline(cx - 5, cx + 5, cy, color);
     canvas.vline(cx, cy - 5, cy + 5, color);
 }
@@ -420,7 +512,7 @@ fn paint_favbar(
         let r = slot.rect;
 
         if p.is_hover(Hit::FavoriteItem(idx)) || app.fav_drag == Some(idx) {
-            canvas.round_fill(r, p.s(3), palette.item_hover, None);
+            canvas.fill(r, palette.item_hover);
         }
 
         // 图标
@@ -457,7 +549,7 @@ fn paint_favbar(
     if fl.has_overflow() {
         let r = fl.overflow;
         if p.is_hover(Hit::FavoriteMore) {
-            canvas.round_fill(r, p.s(3), palette.item_hover, None);
+            canvas.fill(r, palette.item_hover);
         }
         canvas.text("\u{00BB}", r, palette.text, font, TEXT_C);
     }
@@ -529,18 +621,23 @@ fn paint_toolbar(
         if r.right > layout.toolbar.right - p.s(8) {
             break;
         }
-        if p.is_hover(Hit::ToolbarButton(i)) {
-            canvas.round_fill(r, p.s(4), palette.item_hover, None);
+        let hot = p.is_hover(Hit::ToolbarButton(i));
+        if hot {
+            canvas.fill(r, palette.button_hover);
+            // 悬停时左侧亮一条强调线：按钮边界是直角的，这根线代替
+            // 「圆角高亮」告诉眼睛当前光标压在哪个方块上
+            canvas.vline(r.left, r.top + p.s(6), r.bottom - p.s(6), palette.accent);
         }
-        canvas.text(TOOLBAR_ITEMS[i].0, r, palette.text, font_icon, TEXT_C);
+        let color = if hot { palette.text_strong } else { palette.icon };
+        canvas.text(TOOLBAR_ITEMS[i].0, r, color, font_icon, TEXT_C);
     }
 
-    // 底部 1px 分隔线（对应 ToolContainerBorder）
+    // 底部 1px 结构线：工具栏与内容区是两回事，用 divider 明确切开
     canvas.hline(
         layout.toolbar.left,
         layout.toolbar.right,
         layout.toolbar.bottom - 1,
-        palette.border_light,
+        palette.divider,
     );
 }
 
@@ -597,7 +694,9 @@ fn draw_tooltip(
     left = left.max(layout.client.left + s(4));
     let top = anchor.bottom + s(2);
     let bubble = rect(left, top, left + w, top + h);
-    canvas.round_fill(bubble, s(4), palette.header_bg, Some(palette.border));
+    // 提示气泡是浮层：直角 + 重一档的边框，和下拉面板、对话框保持同一套
+    canvas.fill(bubble, palette.address_bg);
+    canvas.border(bubble, palette.divider);
     canvas.text(text, bubble, palette.text, font, TEXT_C);
 }
 
@@ -634,21 +733,33 @@ fn paint_navbar(
         (layout.btn_up, Hit::Up, ICON_UP, can_up),
     ] {
         if hover == hit && enabled {
-            canvas.round_fill(r, p.s(4), palette.item_hover, None);
+            canvas.fill(r, palette.button_hover);
         }
         // 到不了的方向压暗，但仍然画出来——位置固定才好形成肌肉记忆
-        let color = if enabled { palette.text } else { palette.text_dim };
+        let color = if enabled {
+            if hover == hit { palette.text_strong } else { palette.icon }
+        } else {
+            palette.icon_dim
+        };
         canvas.text(glyph, r, color, font_icon, TEXT_C);
     }
 
     // ---- 地址栏 ----
+    // 编辑态用强调色描边 + 淡强调底：一看就知道「这个框现在是活动输入目标」。
+    // 描边负责「在哪」，底色负责「整块都是活动的」，两者同源才不打架。
     let addr = layout.address;
-    canvas.round_fill(
-        addr,
-        p.s(3),
-        palette.address_bg,
-        Some(palette.address_border),
-    );
+    let addr_border = if app.address_editing {
+        palette.accent_border
+    } else {
+        palette.address_border
+    };
+    let addr_bg = if app.address_editing {
+        palette.accent_soft
+    } else {
+        palette.address_bg
+    };
+    canvas.fill(addr, addr_bg);
+    canvas.border(addr, addr_border);
 
     // 地址栏就是一个普通文本框：平时也显示完整路径，点一下即可编辑
     {
@@ -671,6 +782,27 @@ fn paint_navbar(
         } else {
             (Vec::new(), 0)
         };
+        // 非编辑态先把层级段算出来：悬停提示要先画在文字底下，
+        // 而且命中测试要用同一份区间，所以这一份既是「画」也是「点」。
+        let segments = if app.address_editing {
+            Vec::new()
+        } else {
+            path_level_segments(&canvas, font, &text, tr)
+        };
+        // 悬停到某一层：这一段淡强调底 + 一条下划线，说明「这里可以点」。
+        // 光有跳转没有提示，用户根本不知道地址栏还能这么用。
+        if hover == Hit::AddressLevel {
+            if let Some((l, r, _)) = segments
+                .iter()
+                .find(|(l, r, _)| app.mouse_x >= *l && app.mouse_x < *r)
+            {
+                canvas.fill(
+                    rect(*l, addr.top + p.s(3), *r, addr.bottom - p.s(3)),
+                    palette.accent_soft,
+                );
+                canvas.hline(*l, *r, addr.bottom - p.s(4), palette.accent);
+            }
+        }
         let save = canvas.clip(tr);
         if let Some((a, b)) = app.address_sel {
             let (s0, s1) = (a.min(b), a.max(b));
@@ -698,24 +830,46 @@ fn paint_navbar(
             // IME 锚点跟着插入符走（闪烁的隐相也要保持位置）
             app.ime_anchor = Some((caret_x, addr.top + p.s(6)));
         }
+        // 区间已经在上面算好了，这里只做移交
+        app.address_segments = segments;
         canvas.unclip(save);
     }
 
     // 刷新按钮
     if hover == Hit::Refresh {
-        canvas.round_fill(layout.btn_refresh, p.s(4), palette.item_hover, None);
+        canvas.fill(layout.btn_refresh, palette.button_hover);
+        canvas.vline(
+            layout.btn_refresh.left,
+            layout.btn_refresh.top + p.s(6),
+            layout.btn_refresh.bottom - p.s(6),
+            palette.accent,
+        );
     }
     canvas.text(
         ICON_REFRESH,
         layout.btn_refresh,
-        palette.text,
+        if hover == Hit::Refresh { palette.text_strong } else { palette.icon },
         font_icon,
         TEXT_C,
     );
 
     // ---- 搜索框 ----
+    // 与地址栏同一套规则：聚焦＝强调色描边 + 淡强调底
     let sr = layout.search;
-    canvas.round_fill(sr, p.s(3), palette.address_bg, Some(palette.address_border));
+    let sr_border = if app.search_focused {
+        palette.accent_border
+    } else {
+        palette.address_border
+    };
+    canvas.fill(
+        sr,
+        if app.search_focused {
+            palette.accent_soft
+        } else {
+            palette.address_bg
+        },
+    );
+    canvas.border(sr, sr_border);
 
     // 搜索框：放大镜 + 输入区。不再放模式标签——搜索统一走系统搜索，
     // 留一个「快速」字样只会让人以为这里还有别的模式可选。
@@ -767,7 +921,7 @@ fn paint_navbar(
         layout.navbar.left,
         layout.navbar.right,
         layout.navbar.bottom - 1,
-        palette.border_light,
+        palette.divider,
     );
 }
 
@@ -798,8 +952,8 @@ fn paint_nav_pane(
     };
 
     canvas.fill(pane, palette.nav_bg);
-    // 与内容区的分界线
-    canvas.vline(pane.right - 1, pane.top, pane.bottom, palette.border_light);
+    // 与内容区的分界线：结构线用 divider，比内部的浅分隔更硬一档
+    canvas.vline(pane.right - 1, pane.top, pane.bottom, palette.divider);
 
     // 先取完所有 &mut app 的图标句柄，再借 nav_rows —— 否则借用冲突
     if app.nav_rows.is_empty() {
@@ -883,18 +1037,29 @@ fn paint_nav_pane(
         };
 
         if selected {
-            canvas.round_fill(
+            canvas.fill(
                 row.rect,
-                s(3),
                 if focused {
                     palette.item_selected
                 } else {
                     palette.item_selected_inactive
                 },
-                None,
+            );
+            // 选中项左缘一条 3px 强调竖条：这一列的「当前在哪」不再依赖
+            // 底色深浅，深色主题下也能一眼扫到
+            canvas.fill(
+                rect(row.rect.left, row.rect.top, row.rect.left + s(3), row.rect.bottom),
+                if focused { palette.accent } else { palette.border },
             );
         } else if hover == Hit::NavItem(i) && app.nav_drag.is_none() {
-            canvas.round_fill(row.rect, s(3), palette.item_hover, None);
+            canvas.fill(row.rect, palette.item_hover);
+        }
+
+        // 文件正悬在这一行上（松手就打标签）：整行点亮 + 四边描强调色。
+        // 底色之外还要描边，因为拖动时指针压在行上、看不清底下是亮还是选中。
+        if app.drop_tag_row == Some(i) {
+            canvas.fill(row.rect, palette.accent_soft);
+            canvas.border(row.rect, palette.accent_border);
         }
 
         // 展开箭头占位：**每一行都留**，哪怕这一行没有子项。
@@ -903,7 +1068,7 @@ fn paint_nav_pane(
         let ar = crate::ui::navpane::arrow_rect(row, scale);
         if row.expandable {
             if hover == Hit::NavArrow(i) {
-                canvas.round_fill(ar, s(2), palette.item_hover, None);
+                canvas.fill(ar, palette.button_hover);
             }
             draw_expander(&canvas, ar, palette, row.expanded);
         }
@@ -923,7 +1088,7 @@ fn paint_nav_pane(
                 icon_x + (icon_px + d) / 2,
                 icon_y + (icon_px + d) / 2,
             );
-            canvas.round_fill(dot, d / 2, color, None);
+            canvas.fill(dot, color);
         } else {
             let hicon = *icons.get(i).unwrap_or(&0) as *mut core::ffi::c_void;
             if !hicon.is_null() {
@@ -992,7 +1157,7 @@ fn paint_nav_pane(
                 row.rect.bottom - s(2),
             );
             let ratio = vol.used_ratio();
-            canvas.round_fill(bar, s(2), palette.progress_track, None);
+            canvas.fill(bar, palette.progress_track);
             let fill_w = ((bar.right - bar.left) as f32 * ratio).round() as i32;
             if fill_w > 0 {
                 let color = if 1.0 - ratio <= 0.10 {
@@ -1001,7 +1166,7 @@ fn paint_nav_pane(
                     palette.progress_fill
                 };
                 let fr = rect(bar.left, bar.top, bar.left + fill_w.max(s(2)), bar.bottom);
-                canvas.round_fill(fr, s(2), color, None);
+                canvas.fill(fr, color);
             }
         }
     }
@@ -1235,7 +1400,7 @@ fn paint_computer_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette
                 text_right,
                 cy - bar_h / 2 + bar_h,
             );
-            canvas.round_fill(tr, s(3), palette.progress_track, None);
+            canvas.fill(tr, palette.progress_track);
             let fill_w = ((tr.right - tr.left) as f32 * ratio).round() as i32;
             if fill_w > 0 {
                 let color = if 1.0 - ratio <= 0.10 {
@@ -1244,7 +1409,7 @@ fn paint_computer_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette
                     palette.progress_fill
                 };
                 let fr = rect(tr.left, tr.top, tr.left + fill_w.max(s(2)), tr.bottom);
-                canvas.round_fill(fr, s(3), color, None);
+                canvas.fill(fr, color);
             }
         }
 
@@ -1358,7 +1523,6 @@ fn paint_grid_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn paint_grid_cell(
     app: &Application,
     canvas: &Canvas,
@@ -1374,6 +1538,7 @@ fn paint_grid_cell(
     selection: &std::collections::HashSet<usize>,
     palette: &Palette,
 ) {
+    let s = |v: i32| (v as f32 * app.layout.scale).round() as i32;
     let selected = selection.contains(&index);
     let hovered = app.hover == Hit::ListItem(index);
     let focused = app.active_tab_focused;
@@ -1384,15 +1549,22 @@ fn paint_grid_cell(
         } else {
             palette.item_selected_inactive
         };
-        canvas.round_fill(r, 3, bg, None);
+        // 网格卡片是独立方块，选中直接整块上色；焦点感由下面的描边补
+        canvas.fill(r, bg);
+        // 左缘 3px 强调条：行视图、导航窗格都是这个方向，"当前"的标记
+        // 不该随视图模式换边——用户切换视图时不该重新学一遍怎么看
+        canvas.fill(
+            rect(r.left, r.top, r.left + s(3), r.bottom),
+            if focused { palette.accent } else { palette.border },
+        );
     } else if hovered {
-        canvas.round_fill(r, 3, palette.item_hover, None);
+        canvas.fill(r, palette.item_hover);
     }
 
     // 焦点框：Ctrl+方向键只移动焦点、不改选择，没有可见标记的话
     // 按下去像是毫无反应。多选时也画，用来指示键盘的起点在哪。
     if app.tabs[app.active_tab].focus == Some(index) && (selection.len() > 1 || !selected) {
-        canvas.border(r, palette.text_dim);
+        canvas.border(r, palette.accent_border);
     }
 
     // 单元格内部的内边距同样要跟缩放走：写死像素值时，字号放大后
@@ -1515,8 +1687,12 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
                 continue;
             }
             let (lft, rgt) = cols[i];
-            canvas.text(label, rect(lft, hdr.top, rgt, hdr.bottom), palette.text_dim, font, align);
-            if i != sort_col {
+            // 排序列的表头用强调色文字：列宽、对齐之外，"按哪一列排"本身就是
+            // 功能状态，值得在表头上直接亮出来
+            let is_sort = i == sort_col;
+            let color = if is_sort { palette.accent } else { palette.text_dim };
+            canvas.text(label, rect(lft, hdr.top, rgt, hdr.bottom), color, font, align);
+            if !is_sort {
                 continue;
             }
             // 排序指示：标题正中间的正上方一个小三角，∧ 升序、∨ 降序
@@ -1528,10 +1704,11 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
             };
             let aw = s(7);
             let ah = s(4).max(3);
-            draw_sort_arrow(&canvas, cx, hdr.top + s(1), aw, ah, !sort.descending, palette.text_dim);
+            draw_sort_arrow(&canvas, cx, hdr.top + s(1), aw, ah, !sort.descending, palette.accent);
         }
 
-        canvas.hline(vr.left, content_right, hdr.bottom - 1, palette.border);
+        // 表头下沿：结构线，比行分隔更硬
+        canvas.hline(vr.left, content_right, hdr.bottom - 1, palette.divider);
 
         // 列之间的竖线：资源管理器同款，鼠标可以拖它改宽度
         for i in 1..4 {
@@ -1539,7 +1716,7 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
                 continue;
             }
             let edge = (cols[i - 1].1 + cols[i].0) / 2;
-            canvas.vline(edge, hdr.top + s(4), hdr.bottom - s(4), palette.border);
+            canvas.vline(edge, hdr.top + s(4), hdr.bottom - s(4), palette.grid_line);
         }
         list_top += row_h;
     }
@@ -1558,6 +1735,11 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
         let hovered = app.hover == Hit::ListItem(idx);
         let focused = app.active_tab_focused;
 
+        // 斑马纹：详细信息视图行高只有 24px，一屏几十行，眼睛很容易串行。
+        // 极轻的隔行底色（±1 级亮度）就能压住，不影响选中/悬停的层级。
+        if show_ext_col && idx % 2 == 1 && !selected && !hovered {
+            canvas.fill(r, palette.row_alt);
+        }
         if selected {
             canvas.fill(
                 r,
@@ -1567,13 +1749,20 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
                     palette.item_selected_inactive
                 },
             );
+            // 选中行左缘 3px 强调条：与导航窗格、标签栏同一套「当前」语言。
+            // 多选时每行都有，扫一眼就知道选了哪几行。
+            canvas.fill(
+                rect(r.left, r.top, r.left + s(3), r.bottom),
+                if focused { palette.accent } else { palette.border },
+            );
         } else if hovered {
             canvas.fill(r, palette.item_hover);
         }
 
-        // 焦点框（与网格视图同一规则）：Ctrl+方向键移动的可见落点
+        // 焦点框（与网格视图同一规则）：Ctrl+方向键移动的可见落点。
+        // 用强调色而不是灰：灰色框和斑马纹、列线混在一起分不出来。
         if app.tabs[active].focus == Some(idx) && (selection.len() > 1 || !selected) {
-            canvas.border(r, palette.text_dim);
+            canvas.border(r, palette.accent_border);
         }
 
         let isz = s(16);
@@ -1586,7 +1775,15 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
             let name_rect = rect(cols[0].0, r.top, cols[0].1 - s(8), r.bottom);
             if let Some((target, text, caret)) = &rename {
                 if *target == idx {
-                    app.ime_anchor = Some(draw_inline_edit(canvas, name_rect, text, *caret, palette, font));
+                    app.ime_anchor = Some(draw_inline_edit(
+                        canvas,
+                        name_rect,
+                        text,
+                        *caret,
+                        app.address_sel,
+                        palette,
+                        font,
+                    ));
                 } else {
                     let name = entry.display_name(show_ext).to_string();
                     canvas.text(&name, name_rect, palette.text, font, TEXT_L);
@@ -1621,7 +1818,15 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
             let name_rect = rect(ix + isz + s(6), r.top, r.right - s(8), r.bottom);
             if let Some((target, text, caret)) = &rename {
                 if *target == idx {
-                    app.ime_anchor = Some(draw_inline_edit(canvas, name_rect, text, *caret, palette, font));
+                    app.ime_anchor = Some(draw_inline_edit(
+                        canvas,
+                        name_rect,
+                        text,
+                        *caret,
+                        app.address_sel,
+                        palette,
+                        font,
+                    ));
                 } else {
                     let name = entry.display_name(show_ext).to_string();
                     canvas.text(&name, name_rect, palette.text, font, TEXT_L);
@@ -1636,6 +1841,23 @@ fn paint_rows_view(app: &mut Application, canvas: &Canvas, vr: RECT, palette: &P
     if max_scroll > 0 {
         draw_scrollbar(canvas, app, ScrollPane::View, vr, scroll, max_scroll, content_h, palette);
     }
+}
+
+/// 画一枚 chip：底色 + 描边，悬停时整块点亮并换成强调色描边。
+///
+/// 详情窗格的「添加」按钮和每个标签 chip 共用它。它们并排出现在同一块面板里，
+/// 状态切换必须一模一样——各写一份的结果就是悬停到不同 chip 上会看到两种
+/// 不同程度的「点亮」，一看就是拼出来的。
+fn paint_chip(canvas: &Canvas, r: RECT, palette: &Palette, hot: bool) {
+    canvas.fill(r, if hot { palette.button_hover } else { palette.chip_bg });
+    canvas.border(
+        r,
+        if hot {
+            palette.accent_border
+        } else {
+            palette.chip_border
+        },
+    );
 }
 
 /// 右侧详细信息窗格。
@@ -1653,7 +1875,8 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
     let font = app.font_ui();
 
     canvas.fill(p, palette.nav_bg);
-    canvas.vline(p.left, p.top, p.bottom, palette.border);
+    // 窗格左沿是结构边界：用 divider，和导航窗格右沿、状态栏上沿同一条重量
+    canvas.vline(p.left, p.top, p.bottom, palette.divider);
 
     // 多选时按第一个选中项预览，和资源管理器一致
     let entry = app
@@ -1663,7 +1886,7 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
     // ---- 上：预览框 ----
     let pv = layout.detail_preview_rect();
     canvas.fill(pv, palette.list_bg);
-    canvas.border(pv, palette.border_light);
+    canvas.border(pv, palette.chip_border);
 
     // 预览内容按当前选中项生成/复用（见 `Application::ensure_preview`）
     match entry.as_ref() {
@@ -1756,10 +1979,18 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
         let bg = if hot {
             palette.button_hover
         } else {
-            palette.header_bg
+            palette.chip_bg
         };
         let fg = if disabled { palette.text_dim } else { palette.text };
-        canvas.round_fill(*r, s(4), bg, Some(palette.border_light));
+        canvas.fill(*r, bg);
+        canvas.border(
+            *r,
+            if hot {
+                palette.accent_border
+            } else {
+                palette.chip_border
+            },
+        );
         canvas.text(labels[i], *r, fg, font, TEXT_C);
     }
 
@@ -1770,7 +2001,7 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
     let pad = s(12);
 
     // 分隔线：按钮区下沿一条、两个模块之间一条（后者是顺序拖动把手）
-    canvas.hline(p.left + pad, p.right - pad, sec.divider_buttons, palette.border_light);
+    canvas.hline(p.left + pad, p.right - pad, sec.divider_buttons, palette.divider);
     if sec.divider_mid > sec.divider_buttons + s(4) {
         // hover/拖动时高亮成强调色粗线：让人看出「这条线能抓」
         // （与导航窗格分组分隔线同一套反馈）
@@ -1779,7 +2010,7 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
             canvas.hline(p.left + pad, p.right - pad, sec.divider_mid, palette.accent);
             canvas.hline(p.left + pad, p.right - pad, sec.divider_mid + 1, palette.accent);
         } else {
-            canvas.hline(p.left + pad, p.right - pad, sec.divider_mid, palette.border_light);
+            canvas.hline(p.left + pad, p.right - pad, sec.divider_mid, palette.divider);
         }
     }
 
@@ -1799,19 +2030,18 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
         font,
         TEXT_L,
     );
-    // 「添加」chip：悬停才点亮，平时只描一条边，免得抢过上面的主按钮
+    // 「添加」chip：悬停才点亮，平时只描一条边，免得抢过上面的主按钮。
+    // chip 用具名 token（chip_bg / chip_border）：它和下拉框、开关属于
+    // 同一层「可选控件」，颜色统一才不会每个面板各长一套。
     let add_hot = app.hover == Hit::DetailTagAdd;
-    canvas.round_fill(
+    paint_chip(&canvas, tags.add, palette, add_hot);
+    canvas.text(
+        "＋ 添加",
         tags.add,
-        s(3),
-        if add_hot {
-            palette.button_hover
-        } else {
-            palette.header_bg
-        },
-        Some(palette.border_light),
+        if add_hot { palette.text_strong } else { palette.text },
+        font,
+        TEXT_C,
     );
-    canvas.text("＋ 添加", tags.add, palette.text, font, TEXT_C);
 
     if tags.chips.is_empty() {
         // 第一行那格让给提示文字，「添加」chip 已经单独排在下一行居中
@@ -1835,13 +2065,8 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
         };
         // 悬停整个 chip 一起点亮：叉太小，只亮叉会看不出这一格是活的
         let hot = app.hover == Hit::DetailTagClose(i);
-        canvas.round_fill(
-            c.chip,
-            s(3),
-            if hot { palette.button_hover } else { palette.header_bg },
-            Some(palette.border_light),
-        );
-        // 色点 + 名字：和导航窗格里的标签行是同一套视觉
+        paint_chip(&canvas, c.chip, palette, hot);
+        // 色点 + 名字：和导航窗格里的标签行是同一套视觉（方形色标）
         let d = s(8);
         let dot = rect(
             c.chip.left + s(8),
@@ -1849,7 +2074,7 @@ fn paint_detail_pane(app: &mut Application, hdc: HDC, layout: &Layout, palette: 
             c.chip.left + s(8) + d,
             c.chip.top + (s(26) + d) / 2,
         );
-        canvas.round_fill(dot, d / 2, color, None);
+        canvas.fill(dot, color);
         canvas.text(
             &name,
             rect(dot.right + s(6), c.chip.top, c.close.left - s(2), c.chip.bottom),
@@ -1941,26 +2166,52 @@ fn draw_inline_edit(
     r: RECT,
     text: &str,
     caret: usize,
+    sel: Option<(usize, usize)>,
     palette: &Palette,
     font: HFONT,
 ) -> (i32, i32) {
-    // 白底 + 强调色边框，与原软件输入框观感一致
-    canvas.fill(r, 0x00FF_FFFF);
+    // 编辑中的单元格就是「当前焦点」：底色跟主题走，描边用强调色。
+    // 这里以前写死白底，深色主题下重命名会闪出一块惨白。
+    canvas.fill(r, palette.address_bg);
     canvas.border(r, palette.accent);
 
     let inner = rect(r.left + 3, r.top, r.right - 3, r.bottom);
     // 插入符按真实字宽量前缀。重命名框里的中文按固定字宽算会偏出半个字，
     // 偏多少还随名字里的字符组合而变，看起来就像光标在乱跳。
-    let prefix: String = text.chars().take(caret).collect();
-    let caret_px = canvas.text_width(&prefix, font);
+    let width_to = |n: usize| -> i32 {
+        let prefix: String = text.chars().take(n).collect();
+        canvas.text_width(&prefix, font)
+    };
+    let caret_px = width_to(caret);
     // 名字比框长时整体左移，插入符才不会被裁在框外
     let shift = (inner.left + caret_px - (inner.right - 2)).max(0);
 
     let save = canvas.clip(inner);
+
+    // 选区要看得见：新建完进入重命名时，名字是「全选」状态，用户直接打字
+    // 就是替换。以前这里只画文字不画选区，看起来像输入框里有一串
+    // 已经确定的名字，敲一个字却把整串都替换了，完全出乎意料。
+    if let Some((a, b)) = sel {
+        let (s0, s1) = (a.min(b), a.max(b));
+        if s1 > s0 {
+            canvas.fill(
+                rect(
+                    inner.left + width_to(s0) - shift,
+                    r.top + 2,
+                    inner.left + width_to(s1) - shift,
+                    r.bottom - 2,
+                ),
+                palette.item_selected,
+            );
+        }
+    }
+
     canvas.text(
         text,
         edit_text_rect(inner.left - shift, inner),
-        0x00_00_0000,
+        // 以前写死纯黑：深色主题下编辑框底色也深，字直接看不见了。
+        // 跟地址栏编辑态用同一个前景色，明暗都正常。
+        palette.text,
         font,
         TEXT_EDIT,
     );
@@ -2011,7 +2262,9 @@ fn paint_addr_suggest(
     let n = app.addr_suggest.len();
     let pad = (8.0 * app.layout.scale).round() as i32;
 
-    canvas.round_fill(pane, 4, palette.header_bg, Some(palette.border));
+    // 下拉面板：浮层，用重一档的结构线才压得住下面的内容
+    canvas.fill(pane, palette.address_bg);
+    canvas.border(pane, palette.divider);
 
     for i in 0..n {
         let r = app.addr_suggest_item_rect(i);
@@ -2067,15 +2320,11 @@ fn draw_scrollbar(
         && app.mouse_y >= bar.thumb.top - s(2)
         && app.mouse_y <= bar.thumb.bottom + s(2);
 
-    let (w, radius) = if dragging || on_thumb {
-        (s(7), s(2))
-    } else {
-        (s(4), s(1))
-    };
+    let w = if dragging || on_thumb { s(7) } else { s(4) };
     // 右边缘与几何一致：变粗时往左长，右边缘不动，滑块不会「跳」一下
     let right = vr.right - s(3);
     let r = rect(right - w, bar.thumb.top, right, bar.thumb.bottom);
-    canvas.round_fill(r, radius, palette.scroll_thumb, None);
+    canvas.fill(r, palette.scroll_thumb);
 }
 
 // ------------------------------------------------------------------ 状态栏
@@ -2086,8 +2335,9 @@ fn paint_statusbar(app: &mut Application, hdc: HDC, layout: &Layout, palette: &P
         return;
     }
     let canvas = Canvas::new(hdc);
-    canvas.fill(r, palette.toolbar_bg);
-    canvas.hline(r.left, r.right, r.top, palette.border_light);
+    canvas.fill(r, palette.statusbar_bg);
+    // 状态栏是一块「托盘」：上沿一条结构线把它和内容区彻底分开
+    canvas.hline(r.left, r.right, r.top, palette.divider);
 
     let active = app.active_tab;
     let total = if app.tabs.is_empty() {
@@ -2148,9 +2398,11 @@ fn paint_statusbar(app: &mut Application, hdc: HDC, layout: &Layout, palette: &P
         // 当前模式那一个高亮，另一个压暗——资源管理器就是这样标出定位的
         let on = (i == 0 && mode == ViewMode::Detail) || (i == 1 && mode == ViewMode::Large);
         if on {
-            canvas.round_fill(btns[i], s(3), palette.item_selected, None);
+            canvas.fill(btns[i], palette.item_selected);
+            // 底边强调条：和标签栏、选中行的「当前」语言同源
+            canvas.hline(btns[i].left, btns[i].right, btns[i].bottom - 1, palette.accent);
         }
-        let color = if on { palette.text } else { palette.text_dim };
+        let color = if on { palette.text_strong } else { palette.icon_dim };
         canvas.text(glyph, btns[i], color, font_icon, TEXT_C);
     }
 }
@@ -2199,7 +2451,9 @@ fn paint_settings(app: &mut Application, hdc: HDC, layout: &Layout, palette: &Pa
     let s = |v: i32| (v as f32 * layout.scale).round() as i32;
     let p = settingspane::panel_rect(app);
 
-    canvas.round_fill(p, s(8), palette.address_bg, Some(palette.border));
+    // 面板是浮层：直角 + 重一档的结构线，靠硬边界把它从底层里切出来
+    canvas.fill(p, palette.address_bg);
+    canvas.border(p, palette.divider);
 
     let font = app.font_ui();
     let font_bold = app.fonts.get(s(15), true);
@@ -2208,42 +2462,50 @@ fn paint_settings(app: &mut Application, hdc: HDC, layout: &Layout, palette: &Pa
 
     // 标题
     let title_r = rect(p.left + s(24), p.top + s(16), p.right - s(48), p.top + s(44));
-    canvas.text("设置", title_r, palette.text, font_bold, TEXT_L);
+    canvas.text("设置", title_r, palette.text_strong, font_bold, TEXT_L);
+    // 标题与条目之间一条结构线：设置项列表从这条线开始，读起来有起点
+    canvas.hline(
+        p.left + s(16),
+        p.right - s(16),
+        title_r.bottom + s(6),
+        palette.divider,
+    );
 
     // 关闭按钮
     let cr = settingspane::close_rect(app);
     if app.hover == Hit::SettingsClose {
-        canvas.round_fill(cr, s(4), palette.item_hover, None);
+        canvas.fill(cr, palette.button_hover);
     }
-    canvas.text("\u{E711}", cr, palette.text, font_icon, TEXT_C);
+    canvas.text("\u{E711}", cr, palette.icon, font_icon, TEXT_C);
 
     for (i, item) in settingspane::ITEMS.iter().enumerate() {
         let r = settingspane::row_rect(app, i);
         let hovered = app.hover == Hit::SettingsItem(i);
         if hovered {
-            canvas.round_fill(r, s(4), palette.item_hover, None);
+            canvas.fill(r, palette.item_hover);
+            canvas.vline(r.left, r.top + s(4), r.bottom - s(4), palette.accent);
         }
 
         let lr = rect(r.left + s(8), r.top, r.right - s(240), r.bottom);
         canvas.text(item.label, lr, palette.text, font, TEXT_L);
 
         if item.id == settingspane::Id::UiScale {
-            // 缩放滑块：灰轨道 + 已选段（强调色）+ 圆形滑块，右边跟当前百分比
+            // 缩放滑块：平板轨道 + 已选段（强调色）+ 方形滑块，右边跟当前百分比。
+            // 滑块刻意做成竖条而不是圆钮——整套界面没有圆角，一个圆钮会像是
+            // 从别的控件库里漏进来的。
             let track = settingspane::scale_track_rect(app, i);
-            let th = (track.bottom - track.top).max(2);
-            let cy = (track.top + track.bottom) / 2;
-            canvas.round_fill(track, th / 2, palette.progress_track, None);
+            canvas.fill(track, palette.slider_track);
 
             let thumb_x = settingspane::scale_thumb_x(app, i);
-            let radius = s(7);
-            // 已选段停在滑块左缘：再往右交给圆本身，圆边缘才能跟灰轨道
-            // 正确混色，不会在滑块左侧留一圈灰晕。
-            let fill_end = (thumb_x - radius).max(track.left);
+            let fill_end = thumb_x.max(track.left);
             if fill_end > track.left {
-                let filled = rect(track.left, track.top, fill_end, track.bottom);
-                canvas.round_fill(filled, th / 2, palette.accent, None);
+                canvas.fill(rect(track.left, track.top, fill_end, track.bottom), palette.accent);
             }
-            canvas.circle_fill(thumb_x, cy, radius, palette.accent, palette.progress_track);
+            // 滑块：比轨道高 8px 的 3px 竖条，超出轨道上下各 4px
+            canvas.fill(
+                rect(thumb_x - s(1), track.top - s(4), thumb_x + s(2), track.bottom + s(4)),
+                palette.accent,
+            );
 
             let pct = format!("{}%", (app.cfg.settings.ui_scale * 100.0).round() as i32);
             canvas.text(
@@ -2254,17 +2516,18 @@ fn paint_settings(app: &mut Application, hdc: HDC, layout: &Layout, palette: &Pa
                 TEXT_R,
             );
         } else {
-            // 复选方框
+            // 复选方框：直角，勾选时整块强调色 + 反白勾
             let box_sz = s(18);
             let bx = r.right - s(16) - box_sz;
             let by = (r.top + r.bottom) / 2 - box_sz / 2;
             let br = rect(bx, by, bx + box_sz, by + box_sz);
             let on = settingspane::value_of(app, item.id);
             if on {
-                canvas.round_fill(br, s(3), palette.accent, None);
+                canvas.fill(br, palette.accent);
                 canvas.text("\u{E73E}", br, palette.text_on_accent, font_icon, TEXT_C);
             } else {
-                canvas.round_fill(br, s(3), palette.address_bg, Some(palette.border));
+                canvas.fill(br, palette.address_bg);
+                canvas.border(br, palette.toggle_off);
             }
         }
     }
@@ -2285,7 +2548,8 @@ fn paint_dialog(app: &mut Application, hdc: HDC, layout: &Layout, palette: &Pale
     canvas.fill_alpha(layout.client, 0x000000, 0x60);
 
     let p = dialog::parts(app);
-    canvas.round_fill(p.panel, s(10), palette.address_bg, Some(palette.border));
+    canvas.fill(p.panel, palette.address_bg);
+    canvas.border(p.panel, palette.divider);
 
     let font = app.font_ui();
     let font_bold = app.fonts.get(s(15), true);
@@ -2306,19 +2570,15 @@ fn paint_dialog(app: &mut Application, hdc: HDC, layout: &Layout, palette: &Pale
             None => return,
         };
 
-    canvas.text(&title, p.title, palette.text, font_bold, TEXT_L);
+    canvas.text(&title, p.title, palette.text_strong, font_bold, TEXT_L);
     if !body.is_empty() {
         canvas.text(&body, p.body, palette.text, font, TEXT_WRAP_L);
     }
 
     if has_input {
         canvas.text(&input_label, p.label, palette.text_dim, font_small, TEXT_L);
-        canvas.round_fill(
-            p.input,
-            s(3),
-            palette.address_bg,
-            Some(palette.address_border),
-        );
+        canvas.fill(p.input, palette.address_bg);
+        canvas.border(p.input, palette.address_border);
         let tr = rect(
             p.input.left + s(8),
             p.input.top,
@@ -2354,18 +2614,17 @@ fn paint_dialog(app: &mut Application, hdc: HDC, layout: &Layout, palette: &Pale
     if has_input && colors {
         for (i, rgb) in dialog::TAG_COLORS.iter().enumerate() {
             let r = dialog::color_rect(app, i);
-            let cx = (r.left + r.right) / 2;
-            let cy = (r.top + r.bottom) / 2;
             let fill = dialog::rgb_to_colorref(*rgb);
-            // 选中项外面套一圈：先把外圈画出来，再用色块盖住中间，
-            // 剩下的就是环。内圈的抗锯齿底色要用环的颜色，不然边上有灰边。
+            // 方形色块。当前项在外侧包一圈强调色，色块本身不动 —— 用户选的
+            // 就是那个颜色，为了标示「选中」把它混掉是最不能接受的做法。
             if i == picked {
-                let ring = palette.text;
-                canvas.circle_fill(cx, cy, s(11), ring, palette.address_bg);
-                canvas.circle_fill(cx, cy, s(8), fill, ring);
-            } else {
-                canvas.circle_fill(cx, cy, s(8), fill, palette.address_bg);
+                canvas.fill(
+                    rect(r.left - s(2), r.top - s(2), r.right + s(2), r.bottom + s(2)),
+                    palette.accent,
+                );
             }
+            canvas.fill(r, fill);
+            canvas.border(r, palette.chip_border);
         }
     }
 
@@ -2382,7 +2641,7 @@ fn paint_dialog(app: &mut Application, hdc: HDC, layout: &Layout, palette: &Pale
             } else {
                 palette.accent
             };
-            canvas.round_fill(r, s(3), fill, None);
+            canvas.fill(r, fill);
             canvas.text(
                 dialog::primary_text(app),
                 r,
@@ -2396,7 +2655,8 @@ fn paint_dialog(app: &mut Application, hdc: HDC, layout: &Layout, palette: &Pale
             } else {
                 palette.address_bg
             };
-            canvas.round_fill(r, s(3), fill, Some(palette.address_border));
+            canvas.fill(r, fill);
+            canvas.border(r, palette.chip_border);
             canvas.text(S::BTN_CANCEL, r, palette.text, font, TEXT_C);
         }
     }
@@ -2429,5 +2689,44 @@ fn nav_icon_key(row: &crate::ui::navpane::NavRow) -> Option<crate::fs::entry::Ic
         NavKind::Network => Some(IconKey::Special(2)),
         // 标签标题自己画色点，不要系统图标
         NavKind::Tag { .. } | NavKind::Separator { .. } | NavKind::Hint { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_levels;
+
+    #[test]
+    fn drive_path_splits_into_levels() {
+        let got: Vec<String> = path_levels(r"C:\Users\me\Desktop")
+            .into_iter()
+            .map(|(_, _, p)| p)
+            .collect();
+        // 盘符段要补反斜杠，否则拿 "C:" 去跳转不是有效路径
+        assert_eq!(got, [r"C:\", r"C:\Users", r"C:\Users\me", r"C:\Users\me\Desktop"]);
+    }
+
+    #[test]
+    fn trailing_separator_does_not_add_a_level() {
+        let got: Vec<String> = path_levels(r"C:\Users\")
+            .into_iter()
+            .map(|(_, _, p)| p)
+            .collect();
+        assert_eq!(got, [r"C:\", r"C:\Users"]);
+    }
+
+    #[test]
+    fn repeated_separators_are_not_levels() {
+        let got: Vec<String> = path_levels(r"\\server\share\dir")
+            .into_iter()
+            .map(|(_, _, p)| p)
+            .collect();
+        // 开头那两个反斜杠切不出可跳转的层级
+        assert_eq!(got, [r"\\server", r"\\server\share", r"\\server\share\dir"]);
+    }
+
+    #[test]
+    fn empty_text_has_no_levels() {
+        assert!(path_levels("").is_empty());
     }
 }

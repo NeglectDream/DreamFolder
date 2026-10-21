@@ -92,7 +92,14 @@ pub fn list_dir(dir: &Path, opts: &ListOptions) -> Result<Listing, String> {
     let (pattern, dir_prefix) = match dir.to_str() {
         Some(s) if s.starts_with(r"\\") => {
             // UNC：\\?\UNC\server\share\*
-            let stripped = s.trim_start_matches('\\').replace('/', "\\");
+            // 共享根（\\server\share）的规范化路径带尾反斜杠，本地盘分支
+            // 处理了它，这里不剥就会拼出 share\\*——verbatim 路径不做
+            // 规范化，双斜杠直接让 FindFirstFileExW 失败。
+            let stripped = s
+                .trim_start_matches('\\')
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_string();
             (
                 format!(r"\\?\UNC\{stripped}\*"),
                 format!(r"\\{stripped}\"),
